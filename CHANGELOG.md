@@ -1,5 +1,76 @@
 # Changelog
 
+## 8.0.0
+
+Teleport 8.0 is a major release of Teleport that contains new features, improvements, and bug fixes.
+
+### New Features
+
+#### Windows Desktop Access 
+
+#### TLS Routing
+
+#### AWS CLI
+
+Teleport adds a new command `tsh aws` to obtain AWS credentials using Teleport SSO/RBAC.
+
+#### Application and Database Automatic Discovery
+
+With auto discovery users can ask Teleport to discover databases and applications in their infrastructure and automatically connect them instead of manually setting them up.
+
+#### WebAuthn
+
+Webauthn support enables Teleport users to use modern second factor devices - apple watch, touch ID.
+
+Second factor management user interface enables users to update and manage their second factor devices in the browsers. Our UI becomes more secure by requiring users performing some privileged actions, for example editing roles for a second factor confirmation.
+
+### Improvements
+
+* Added support for [CockroachDB](https://www.cockroachlabs.com) to Database Access. [#8505](https://github.com/gravitational/teleport/pull/8505)
+* Reduced network utilization on large clusters during login. [#8471](https://github.com/gravitational/teleport/pull/8471)
+* Added metrics and added the ability for `tctl top` to show network utilization for resource propagation. [#8338](https://github.com/gravitational/teleport/pull/8338) [#8603](https://github.com/gravitational/teleport/pull/8603) [#8491](https://github.com/gravitational/teleport/pull/8491)
+* Added support for account recovery and cancellation. [#6769](https://github.com/gravitational/teleport/pull/6769)
+* Added per-session MFA support to Database Access. [#8270](https://github.com/gravitational/teleport/pull/8270)
+* Added support for profile specific `kubeconfig`. [#7840](https://github.com/gravitational/teleport/pull/7840)
+
+### Fixes
+
+* Fixed issues with web applications that utilized [EventSource](https://developer.mozilla.org/en-US/docs/Web/API/EventSource) with Application Access. [#8359](https://github.com/gravitational/teleport/pull/8359)
+* Fixed issue were interactive sessions would always return exit code 0. [#8081](https://github.com/gravitational/teleport/pull/8081)
+* Fixed issue where JWT signer was omitted from bootstrap logic. [#8119](https://github.com/gravitational/teleport/pull/8119)
+
+### Breaking Changes
+
+#### CentOS 6
+
+CentOS 6 support will be deprecated in Teleport 8 and removed in Teleport 9.
+
+Teleport 8 will continue to receive security patches for about 9 months after which it will be EOL. Users are encouraged to upgrade to CentOS 7 in that time frame.
+
+#### Updated  dependencies
+
+New run time dependencies have been added to Teleport 8 due to the inclusion of Rust in the build chain. Teleport 8 requires `libgcc_s.so` and `libm.so` be installed on systems running Teleport.
+
+Users of [distroless](https://github.com/GoogleContainerTools/distroless) container images are encouraged to use the [gcr.io/distroless/cc-debian11](https://github.com/GoogleContainerTools/distroless/blob/main/examples/rust/Dockerfile) image to run Teleport.
+
+```
+FROM gcr.io/distroless/cc-debian11
+```
+
+Alpine users are recommended to install the `libgcc` package in addition to any glibc compatibility layer they have already been using.
+
+```
+apk --update --no-cache add libgcc
+```
+
+#### Database Access Certificates
+
+With the `CommonName` field no longer supported in Go 1.17, Database Access users are...
+
+#### Role Changes
+
+New clusters will no longer have the default `admin` role, it has been replaced with 3 smaller scoped roles: `access`, `auditor`, and `editor`.
+
 ## 7.0.0
 
 Teleport 7.0 is a major release of Teleport that contains new features, improvements, and bug fixes.
