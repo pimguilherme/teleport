@@ -12,11 +12,24 @@ Teleport 8.0 is a major release of Teleport that contains new features, improvem
 
 #### AWS CLI
 
-Teleport adds a new command `tsh aws` to obtain AWS credentials using Teleport SSO/RBAC.
+Teleport application access extends AWS console support to CLI . Users are able to log into their AWS console using `tsh app login`
+and use `tsh aws` commands to interact with AWS APIs.
 
-#### Application and Database Automatic Discovery
+See more info in the [documentation](https://goteleport.com/docs/ver/8.0/application-access/guides/aws-console/#step-8-using-aws-cli).
 
-With auto discovery users can ask Teleport to discover databases and applications in their infrastructure and automatically connect them instead of manually setting them up.
+#### Application and Database Dynamic Registration
+
+With dynamic registration users are able to manage applications and databases without needing to update static YAML configuration
+or restart application or database agents.
+
+See dynamic registration guides for [apps](https://goteleport.com/docs/ver/8.0/application-access/guides/dynamic-registration/)
+and [databases](https://goteleport.com/docs/ver/8.0/database-access/guides/dynamic-registration/).
+
+#### RDS Automatic Discovery
+
+With RDS auto discovery Teleport database agents can automatically discover RDS instances and Aurora clusters in an AWS account.
+
+See updated [RDS guide](https://goteleport.com/docs/ver/8.0/database-access/guides/rds/) for more information.
 
 #### WebAuthn
 
@@ -65,7 +78,12 @@ apk --update --no-cache add libgcc
 
 #### Database Access Certificates
 
-With the `CommonName` field no longer supported in Go 1.17, Database Access users are...
+With the `GODEBUG=x509ignoreCN=0` flag removed in Go 1.17, Database Access users will no longer be able to connect to databases that
+include their hostname in the `CommonName` field of the presented certificate. Users are recommended to update their database
+certificates to include hostname in the `Subject Alternative Name` extension instead.
+
+Subscribe to Github issue [#7636](https://github.com/gravitational/teleport/issues/7636) which will add ability to control level
+of TLS verification as a workaround.
 
 #### Role Changes
 
