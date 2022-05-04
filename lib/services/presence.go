@@ -29,6 +29,12 @@ type ProxyGetter interface {
 	GetProxies() ([]types.Server, error)
 }
 
+// NodesGetter is a service that gets nodes.
+type NodesGetter interface {
+	// GetNodes returns a list of registered servers.
+	GetNodes(ctx context.Context, namespace string, opts ...MarshalOption) ([]types.Server, error)
+}
+
 // Presence records and reports the presence of all components
 // of the cluster - Nodes, Proxies and SSH nodes
 type Presence interface {
@@ -43,12 +49,11 @@ type Presence interface {
 
 	// GetNode returns a node by name and namespace.
 	GetNode(ctx context.Context, namespace, name string) (types.Server, error)
-
-	// GetNodes returns a list of registered servers.
-	GetNodes(ctx context.Context, namespace string, opts ...MarshalOption) ([]types.Server, error)
-
 	// ListNodes returns a paginated list of registered servers.
 	ListNodes(ctx context.Context, req proto.ListNodesRequest) (nodes []types.Server, nextKey string, err error)
+
+	// NodesGetter gets nodes
+	NodesGetter
 
 	// DeleteAllNodes deletes all nodes in a namespace.
 	DeleteAllNodes(ctx context.Context, namespace string) error
@@ -103,7 +108,7 @@ type Presence interface {
 	GetReverseTunnel(name string, opts ...MarshalOption) (types.ReverseTunnel, error)
 
 	// GetReverseTunnels returns a list of registered servers
-	GetReverseTunnels(opts ...MarshalOption) ([]types.ReverseTunnel, error)
+	GetReverseTunnels(ctx context.Context, opts ...MarshalOption) ([]types.ReverseTunnel, error)
 
 	// DeleteReverseTunnel deletes reverse tunnel by it's domain name
 	DeleteReverseTunnel(domainName string) error
@@ -175,7 +180,11 @@ type Presence interface {
 	DeleteAllRemoteClusters() error
 
 	// UpsertKubeService registers kubernetes service presence.
+	// DELETE in 11.0. Deprecated, use UpsertKubeServiceV2
 	UpsertKubeService(context.Context, types.Server) error
+
+	// UpsertKubeServiceV2 registers kubernetes service presence
+	UpsertKubeServiceV2(context.Context, types.Server) (*types.KeepAlive, error)
 
 	// GetAppServers gets all application servers.
 	//
@@ -226,10 +235,15 @@ type Presence interface {
 
 	// GetWindowsDesktopServices returns all registered Windows desktop services.
 	GetWindowsDesktopServices(context.Context) ([]types.WindowsDesktopService, error)
+	// GetWindowsDesktopService returns a Windows desktop service by name
+	GetWindowsDesktopService(ctx context.Context, name string) (types.WindowsDesktopService, error)
 	// UpsertWindowsDesktopService creates or updates a new Windows desktop service.
 	UpsertWindowsDesktopService(context.Context, types.WindowsDesktopService) (*types.KeepAlive, error)
 	// DeleteWindowsDesktopService removes the specified Windows desktop service.
 	DeleteWindowsDesktopService(ctx context.Context, name string) error
 	// DeleteAllWindowsDesktopServices removes all Windows desktop services.
 	DeleteAllWindowsDesktopServices(context.Context) error
+
+	// ListResoures returns a paginated list of resources.
+	ListResources(ctx context.Context, req proto.ListResourcesRequest) (*types.ListResourcesResponse, error)
 }

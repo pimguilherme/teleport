@@ -34,12 +34,13 @@ import (
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/sshutils"
 	"github.com/gravitational/teleport/lib/utils"
 
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/pborman/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 )
@@ -55,11 +56,19 @@ var ( // failedConnectingToNode counts failed attempts to connect to a node
 	failedConnectingToNode = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: teleport.MetricFailedConnectToNodeAttempts,
-			Help: "Number of failed attempts to connect to a node",
+			Help: "Number of failed SSH connection attempts to a node. Use with `teleport_connect_to_node_attempts_total` to get the failure rate.",
 		},
 	)
 
-	prometheusCollectors = []prometheus.Collector{proxiedSessions, failedConnectingToNode}
+	connectingToNode = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: teleport.MetricNamespace,
+			Name:      teleport.MetricConnectToNodeAttempts,
+			Help:      "Number of SSH connection attempts to a node. Use with `failed_connect_to_node_attempts_total` to get the failure rate.",
+		},
+	)
+
+	prometheusCollectors = []prometheus.Collector{proxiedSessions, failedConnectingToNode, connectingToNode}
 )
 
 // proxySubsys implements an SSH subsystem for proxying listening sockets from
@@ -314,18 +323,15 @@ func (t *proxySubsys) proxyToHost(
 	// network resolution (by IP or DNS)
 	//
 	var (
-		strategy types.RoutingStrategy
-		servers  []types.Server
-		err      error
+		strategy    types.RoutingStrategy
+		nodeWatcher *services.NodeWatcher
+		err         error
 	)
 	localCluster, _ := t.srv.proxyAccessPoint.GetClusterName()
 	// going to "local" CA? lets use the caching 'auth service' directly and avoid
 	// hitting the reverse tunnel link (it can be offline if the CA is down)
 	if site.GetName() == localCluster.GetName() {
-		servers, err = t.srv.proxyAccessPoint.GetNodes(ctx.CancelContext(), t.namespace)
-		if err != nil {
-			t.log.Warn(err)
-		}
+		nodeWatcher = t.srv.nodeWatcher
 
 		cfg, err := t.srv.authService.GetClusterNetworkingConfig(ctx.CancelContext())
 		if err != nil {
@@ -339,9 +345,11 @@ func (t *proxySubsys) proxyToHost(
 		if err != nil {
 			t.log.Warn(err)
 		} else {
-			servers, err = siteClient.GetNodes(ctx.CancelContext(), t.namespace)
+			watcher, err := site.NodeWatcher()
 			if err != nil {
 				t.log.Warn(err)
+			} else {
+				nodeWatcher = watcher
 			}
 
 			cfg, err := siteClient.GetClusterNetworkingConfig(ctx.CancelContext())
@@ -358,7 +366,7 @@ func (t *proxySubsys) proxyToHost(
 	t.log.Debugf("proxy connecting to host=%v port=%v, exact port=%v, strategy=%s", t.host, t.port, t.SpecifiedPort(), strategy)
 
 	// determine which server to connect to
-	server, err := t.getMatchingServer(servers, strategy)
+	server, err := t.getMatchingServer(nodeWatcher, strategy)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -405,6 +413,7 @@ func (t *proxySubsys) proxyToHost(
 		AddrNetwork: "tcp",
 		Addr:        serverAddr,
 	}
+	connectingToNode.Inc()
 	conn, err := site.Dial(reversetunnel.DialParams{
 		From:         remoteAddr,
 		To:           toAddr,
@@ -444,47 +453,59 @@ func (t *proxySubsys) proxyToHost(
 	return nil
 }
 
+// NodesGetter is a function that retrieves a subset of nodes matching
+// the filter criteria.
+type NodesGetter interface {
+	GetNodes(fn func(n services.Node) bool) []types.Server
+}
+
 // getMatchingServer determines the server to connect to from the provided servers. Duplicate entries are treated
 // differently based on strategy. Legacy behavior of returning an ambiguous error occurs if the strategy
 // is types.RoutingStrategy_UNAMBIGUOUS_MATCH. When the strategy is types.RoutingStrategy_MOST_RECENT then
 // the server that has heartbeated most recently will be returned instead of an error. If no matches are found then
 // both the types.Server and error returned will be nil.
-func (t *proxySubsys) getMatchingServer(servers []types.Server, strategy types.RoutingStrategy) (types.Server, error) {
-	// check if hostname is a valid uuid.  If it is, we will preferentially match
-	// by node ID over node hostname.
-	hostIsUUID := uuid.Parse(t.host) != nil
+func (t *proxySubsys) getMatchingServer(watcher NodesGetter, strategy types.RoutingStrategy) (types.Server, error) {
+	if watcher == nil {
+		return nil, trace.NotFound("unable to retrieve nodes matching host %s", t.host)
+	}
+
+	// check if hostname is a valid uuid or EC2 node ID.  If it is, we will
+	// preferentially match by node ID over node hostname.
+	_, err := uuid.Parse(t.host)
+	hostIsUniqueID := err == nil || utils.IsEC2NodeID(t.host)
 
 	ips, _ := net.LookupHost(t.host)
 
+	var unambiguousIDMatch bool
 	// enumerate and try to find a server with self-registered with a matching name/IP:
-	var matches []types.Server
-	for _, server := range servers {
-		// If the host parameter is a UUID, and it matches the Node ID,
-		// treat this as an unambiguous match.
-		if hostIsUUID && server.GetName() == t.host {
-			matches = []types.Server{server}
-			break
+	matches := watcher.GetNodes(func(server services.Node) bool {
+		if unambiguousIDMatch {
+			return false
+		}
+
+		// If the host parameter is a UUID or EC2 node ID, and it matches the
+		// Node ID, treat this as an unambiguous match.
+		if hostIsUniqueID && server.GetName() == t.host {
+			unambiguousIDMatch = true
+			return true
 		}
 		// If the server has connected over a reverse tunnel, match only on hostname.
 		if server.GetUseTunnel() {
-			if t.host == server.GetHostname() {
-				matches = append(matches, server)
-			}
-			continue
+			return t.host == server.GetHostname()
 		}
 
 		ip, port, err := net.SplitHostPort(server.GetAddr())
 		if err != nil {
 			t.log.Errorf("Failed to parse address %q: %v.", server.GetAddr(), err)
-			continue
+			return false
 		}
 		if t.host == ip || t.host == server.GetHostname() || apiutils.SliceContainsStr(ips, ip) {
 			if !t.SpecifiedPort() || t.port == port {
-				matches = append(matches, server)
-				continue
+				return true
 			}
 		}
-	}
+		return false
+	})
 
 	var server types.Server
 	switch {
@@ -502,16 +523,20 @@ func (t *proxySubsys) getMatchingServer(servers []types.Server, strategy types.R
 		server = matches[0]
 	}
 
-	// If we matched zero nodes but hostname is a UUID then it isn't sane
-	// to fallback to dns based resolution.  This has the unfortunate
-	// consequence of preventing users from calling OpenSSH nodes which
-	// happen to use hostnames which are also valid UUIDs.  This restriction
-	// is necessary in order to protect users attempting to connect to a
-	// node by UUID from being re-routed to an unintended target if the node
-	// is offline.  This restriction can be lifted if we decide to move to
-	// explicit UUID based resolution in the future.
-	if hostIsUUID && server == nil {
-		return nil, trace.NotFound("unable to locate node matching uuid-like target %s", t.host)
+	// If we matched zero nodes but hostname is a UUID (or EC2 node ID) then it
+	// isn't sane to fallback to dns based resolution.  This has the unfortunate
+	// consequence of preventing users from calling OpenSSH nodes which happen
+	// to use hostnames which are also valid UUIDs.  This restriction is
+	// necessary in order to protect users attempting to connect to a node by
+	// UUID from being re-routed to an unintended target if the node is offline.
+	// This restriction can be lifted if we decide to move to explicit UUID
+	// based resolution in the future.
+	if hostIsUniqueID && server == nil {
+		idType := "UUID"
+		if utils.IsEC2NodeID(t.host) {
+			idType = "EC2"
+		}
+		return nil, trace.NotFound("unable to locate node matching %s-like target %s", idType, t.host)
 	}
 
 	return server, nil

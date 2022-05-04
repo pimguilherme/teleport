@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"io"
 	"net"
 	"strings"
@@ -28,19 +29,15 @@ import (
 
 	"github.com/jonboulle/clockwork"
 
+	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/srv/alpnproxy/common"
-	dbcommon "github.com/gravitational/teleport/lib/srv/db/dbutils"
+	"github.com/gravitational/teleport/lib/srv/db/dbutils"
 	"github.com/gravitational/teleport/lib/utils"
 
 	"github.com/gravitational/trace"
 	"github.com/sirupsen/logrus"
-)
-
-const (
-	// KubeSNIPrefix is a SNI Kubernetes prefix used for distinguishing the Kubernetes HTTP traffic.
-	KubeSNIPrefix = "kube"
 )
 
 // ProxyConfig  is the configuration for an ALPN proxy server.
@@ -102,6 +99,37 @@ func MatchByProtocol(protocols ...common.Protocol) MatchFunc {
 func MatchByALPNPrefix(prefix string) MatchFunc {
 	return func(sni, alpn string) bool {
 		return strings.HasPrefix(alpn, prefix)
+	}
+}
+
+// ExtractMySQLEngineVersion returns a pre-process function for MySQL connections that tries to extract MySQL server version
+// from incoming connection.
+func ExtractMySQLEngineVersion(fn func(ctx context.Context, conn net.Conn) error) HandlerFuncWithInfo {
+	return func(ctx context.Context, conn net.Conn, info ConnectionInfo) error {
+		const mysqlVerStart = len(common.ProtocolMySQLWithVerPrefix)
+
+		for _, alpn := range info.ALPN {
+			if !strings.HasPrefix(alpn, string(common.ProtocolMySQLWithVerPrefix)) || len(alpn) == mysqlVerStart {
+				continue
+			}
+			// The version should never be longer than 255 characters including
+			// the prefix, but better to be safe.
+			var versionEnd = 255
+			if len(alpn) < versionEnd {
+				versionEnd = len(alpn)
+			}
+
+			mysqlVersionBase64 := alpn[mysqlVerStart:versionEnd]
+			mysqlVersionBytes, err := base64.StdEncoding.DecodeString(mysqlVersionBase64)
+			if err != nil {
+				continue
+			}
+
+			ctx = context.WithValue(ctx, dbutils.ContextMySQLServerVersion, string(mysqlVersionBytes))
+			break
+		}
+
+		return fn(ctx, conn)
 	}
 }
 
@@ -180,6 +208,9 @@ func (h *HandlerDecs) handle(ctx context.Context, conn net.Conn, info Connection
 	if h.HandlerWithConnInfo != nil {
 		return h.HandlerWithConnInfo(ctx, conn, info)
 	}
+	if h.Handler == nil {
+		return trace.BadParameter("failed to find ALPN handler for ALPN: %v, SNI %v", info.ALPN, info.SNI)
+	}
 	return h.Handler(ctx, conn)
 }
 
@@ -193,7 +224,10 @@ type Proxy struct {
 	cfg                ProxyConfig
 	supportedProtocols []common.Protocol
 	log                logrus.FieldLogger
-	cancel             context.CancelFunc
+
+	// mu guards cancel
+	mu     sync.Mutex
+	cancel context.CancelFunc
 }
 
 // CheckAndSetDefaults checks and sets default values of ProxyConfig
@@ -254,7 +288,15 @@ func New(cfg ProxyConfig) (*Proxy, error) {
 func (p *Proxy) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	p.mu.Lock()
+	if p.cancel != nil {
+		p.mu.Unlock()
+		return trace.BadParameter("Serve may only be called once")
+	}
 	p.cancel = cancel
+	p.mu.Unlock()
+
 	p.cfg.WebTLSConfig.NextProtos = common.ProtocolsToString(p.supportedProtocols)
 	for {
 		clientConn, err := p.cfg.Listener.Accept()
@@ -337,7 +379,7 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn) error {
 		return trace.Wrap(err)
 	}
 
-	isDatabaseConnection, err := dbcommon.IsDatabaseConnection(tlsConn.ConnectionState())
+	isDatabaseConnection, err := dbutils.IsDatabaseConnection(tlsConn.ConnectionState())
 	if err != nil {
 		p.log.WithError(err).Debug("Failed to check if connection is database connection.")
 	}
@@ -347,7 +389,7 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn) error {
 	return trace.Wrap(handlerDesc.handle(ctx, tlsConn, connInfo))
 }
 
-// getTLSConfig returns HandlerDecs.TLSConfig if custom TLS configuration was set for the handler
+// getTLSConfig returns HandlerDesc.TLSConfig if custom TLS configuration was set for the handler
 // otherwise the ProxyConfig.WebTLSConfig is used.
 func (p *Proxy) getTLSConfig(desc *HandlerDecs) *tls.Config {
 	if desc.TLSConfig != nil {
@@ -417,7 +459,7 @@ func (p *Proxy) databaseHandlerWithTLSTermination(ctx context.Context, conn net.
 		return trace.Wrap(err)
 	}
 
-	isDatabaseConnection, err := dbcommon.IsDatabaseConnection(tlsConn.ConnectionState())
+	isDatabaseConnection, err := dbutils.IsDatabaseConnection(tlsConn.ConnectionState())
 	if err != nil {
 		p.log.WithError(err).Debug("Failed to check if connection is database connection.")
 	}
@@ -425,15 +467,6 @@ func (p *Proxy) databaseHandlerWithTLSTermination(ctx context.Context, conn net.
 		return trace.BadParameter("not database connection")
 	}
 	return trace.Wrap(p.handleDatabaseConnection(ctx, tlsConn, info))
-}
-
-func isDBTLSProtocol(protocol common.Protocol) bool {
-	switch protocol {
-	case common.ProtocolMongoDB:
-		return true
-	default:
-		return false
-	}
 }
 
 func (p *Proxy) getHandlerDescBaseOnClientHelloMsg(clientHelloInfo *tls.ClientHelloInfo) (*HandlerDecs, error) {
@@ -457,7 +490,7 @@ func (p *Proxy) getHandleDescBasedOnALPNVal(clientHelloInfo *tls.ClientHelloInfo
 
 	for _, v := range clientProtocols {
 		protocol := common.Protocol(v)
-		if isDBTLSProtocol(protocol) {
+		if common.IsDBTLSProtocol(protocol) {
 			return &HandlerDecs{
 				MatchFunc:           MatchByProtocol(protocol),
 				HandlerWithConnInfo: p.databaseHandlerWithTLSTermination,
@@ -476,14 +509,22 @@ func (p *Proxy) getHandleDescBasedOnALPNVal(clientHelloInfo *tls.ClientHelloInfo
 }
 
 func shouldRouteToKubeService(sni string) bool {
-	return strings.HasPrefix(sni, KubeSNIPrefix)
+	// DELETE IN 11.0. Deprecated, use only KubeTeleportProxyALPNPrefix.
+	if strings.HasPrefix(sni, constants.KubeSNIPrefix) {
+		return true
+	}
+
+	return strings.HasPrefix(sni, constants.KubeTeleportProxyALPNPrefix)
 }
 
 // Close the Proxy server.
 func (p *Proxy) Close() error {
+	p.mu.Lock()
 	if p.cancel != nil {
 		p.cancel()
 	}
+	p.mu.Unlock()
+
 	if err := p.cfg.Listener.Close(); err != nil {
 		return trace.Wrap(err)
 	}

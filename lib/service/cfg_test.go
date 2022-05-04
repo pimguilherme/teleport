@@ -89,6 +89,11 @@ func TestDefaultConfig(t *testing.T) {
 	proxy := config.Proxy
 	require.Equal(t, proxy.Limiter.MaxConnections, int64(defaults.LimiterMaxConnections))
 	require.Equal(t, proxy.Limiter.MaxNumberOfUsers, defaults.LimiterMaxConcurrentUsers)
+
+	// Misc levers and dials
+	require.Equal(t, config.RotationConnectionInterval, defaults.HighResPollingPeriod)
+	require.Equal(t, config.RestartThreshold.Amount, defaults.MaxConnectionErrorsBeforeRestart)
+	require.Equal(t, config.RestartThreshold.Time, defaults.ConnectionErrorMeasurementPeriod)
 }
 
 // TestCheckApp validates application configuration.
@@ -224,7 +229,9 @@ func TestCheckDatabase(t *testing.T) {
 				Name:     "example",
 				Protocol: defaults.ProtocolPostgres,
 				URI:      "localhost:5432",
-				CACert:   []byte("cert"),
+				TLS: DatabaseTLS{
+					CACert: []byte("cert"),
+				},
 			},
 			outErr: true,
 		},
@@ -238,7 +245,9 @@ func TestCheckDatabase(t *testing.T) {
 					ProjectID:  "project-1",
 					InstanceID: "instance-1",
 				},
-				CACert: fixtures.LocalhostCert,
+				TLS: DatabaseTLS{
+					CACert: fixtures.LocalhostCert,
+				},
 			},
 			outErr: false,
 		},
@@ -251,7 +260,9 @@ func TestCheckDatabase(t *testing.T) {
 				GCP: DatabaseGCP{
 					ProjectID: "project-1",
 				},
-				CACert: fixtures.LocalhostCert,
+				TLS: DatabaseTLS{
+					CACert: fixtures.LocalhostCert,
+				},
 			},
 			outErr: true,
 		},
@@ -264,7 +275,9 @@ func TestCheckDatabase(t *testing.T) {
 				GCP: DatabaseGCP{
 					InstanceID: "instance-1",
 				},
-				CACert: fixtures.LocalhostCert,
+				TLS: DatabaseTLS{
+					CACert: fixtures.LocalhostCert,
+				},
 			},
 			outErr: true,
 		},
@@ -277,9 +290,77 @@ func TestCheckDatabase(t *testing.T) {
 			},
 			outErr: false,
 		},
+		{
+			desc: "SQL Server correct configuration",
+			inDatabase: Database{
+				Name:     "sqlserver",
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "localhost:1433",
+				AD: DatabaseAD{
+					KeytabFile: "/etc/keytab",
+					Domain:     "test-domain",
+					SPN:        "test-spn",
+				},
+			},
+			outErr: false,
+		},
+		{
+			desc: "SQL Server missing keytab",
+			inDatabase: Database{
+				Name:     "sqlserver",
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "localhost:1433",
+				AD: DatabaseAD{
+					Domain: "test-domain",
+					SPN:    "test-spn",
+				},
+			},
+			outErr: true,
+		},
+		{
+			desc: "SQL Server missing AD domain",
+			inDatabase: Database{
+				Name:     "sqlserver",
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "localhost:1433",
+				AD: DatabaseAD{
+					KeytabFile: "/etc/keytab",
+					SPN:        "test-spn",
+				},
+			},
+			outErr: true,
+		},
+		{
+			desc: "SQL Server missing SPN",
+			inDatabase: Database{
+				Name:     "sqlserver",
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "localhost:1433",
+				AD: DatabaseAD{
+					KeytabFile: "/etc/keytab",
+					Domain:     "test-domain",
+				},
+			},
+			outErr: true,
+		},
+		{
+			desc: "MySQL with server version",
+			inDatabase: Database{
+				Name:     "mysql-foo",
+				Protocol: defaults.ProtocolMySQL,
+				URI:      "localhost:3306",
+				MySQL: MySQLOptions{
+					ServerVersion: "8.0.31",
+				},
+			},
+			outErr: false,
+		},
 	}
 	for _, test := range tests {
+		test := test
 		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
 			err := test.inDatabase.CheckAndSetDefaults()
 			if test.outErr {
 				require.Error(t, err)

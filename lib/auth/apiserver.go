@@ -17,24 +17,18 @@ limitations under the License.
 package auth
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/lib/auth/u2f"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/httplib"
@@ -43,7 +37,6 @@ import (
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/utils"
 
-	"github.com/gravitational/form"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/julienschmidt/httprouter"
@@ -91,6 +84,7 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 		Clock:     clockwork.NewRealClock(),
 	}
 	srv.Router = *httprouter.New()
+	srv.Router.UseRawPath = true
 
 	// Kubernetes extensions
 	srv.POST("/:version/kube/csr", srv.withAuth(srv.processKubeCSR))
@@ -115,9 +109,6 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.GET("/:version/users/:user", srv.withAuth(srv.getUser))
 	srv.DELETE("/:version/users/:user", srv.withAuth(srv.deleteUser)) // DELETE IN: 5.2 REST method is replaced by grpc method with context.
 
-	// Generating keypairs
-	srv.POST("/:version/keypair", srv.withAuth(srv.generateKeyPair))
-
 	// Passwords and sessions
 	srv.POST("/:version/users", srv.withAuth(srv.upsertUser))
 	srv.PUT("/:version/users/:user/web/password", srv.withAuth(srv.changePassword))
@@ -128,7 +119,6 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.POST("/:version/users/:user/ssh/authenticate", srv.withAuth(srv.authenticateSSHUser))
 	srv.GET("/:version/users/:user/web/sessions/:sid", srv.withAuth(srv.getWebSession))
 	srv.DELETE("/:version/users/:user/web/sessions/:sid", srv.withAuth(srv.deleteWebSession))
-	srv.POST("/:version/web/password/token", srv.withRate(srv.withAuth(srv.changePasswordWithToken)))
 
 	// Servers and presence heartbeat
 	srv.POST("/:version/namespaces/:namespace/nodes", srv.withAuth(srv.upsertNode))
@@ -150,9 +140,7 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.DELETE("/:version/tunnelconnections/:cluster", srv.withAuth(srv.deleteTunnelConnections))
 	srv.DELETE("/:version/tunnelconnections", srv.withAuth(srv.deleteAllTunnelConnections))
 
-	// Server Credentials
-	srv.POST("/:version/server/credentials", srv.withAuth(srv.generateHostCerts))
-
+	// Remote clusters
 	srv.POST("/:version/remoteclusters", srv.withAuth(srv.createRemoteCluster))
 	srv.GET("/:version/remoteclusters/:cluster", srv.withAuth(srv.getRemoteCluster))
 	srv.GET("/:version/remoteclusters", srv.withAuth(srv.getRemoteClusters))
@@ -176,14 +164,12 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.POST("/:version/tokens/register", srv.withAuth(srv.registerUsingToken))
 	srv.POST("/:version/tokens/register/auth", srv.withAuth(srv.registerNewAuthServer))
 
-	// active sesssions
+	// Active sessions
 	srv.POST("/:version/namespaces/:namespace/sessions", srv.withAuth(srv.createSession))
 	srv.PUT("/:version/namespaces/:namespace/sessions/:id", srv.withAuth(srv.updateSession))
 	srv.DELETE("/:version/namespaces/:namespace/sessions/:id", srv.withAuth(srv.deleteSession))
 	srv.GET("/:version/namespaces/:namespace/sessions", srv.withAuth(srv.getSessions))
 	srv.GET("/:version/namespaces/:namespace/sessions/:id", srv.withAuth(srv.getSession))
-	srv.POST("/:version/namespaces/:namespace/sessions/:id/slice", srv.withAuth(srv.postSessionSlice))
-	srv.POST("/:version/namespaces/:namespace/sessions/:id/recording", srv.withAuth(srv.uploadSessionRecording))
 	srv.GET("/:version/namespaces/:namespace/sessions/:id/stream", srv.withAuth(srv.getSessionChunk))
 	srv.GET("/:version/namespaces/:namespace/sessions/:id/events", srv.withAuth(srv.getSessionEvents))
 
@@ -192,13 +178,6 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.GET("/:version/namespaces", srv.withAuth(srv.getNamespaces))
 	srv.GET("/:version/namespaces/:namespace", srv.withAuth(srv.getNamespace))
 	srv.DELETE("/:version/namespaces/:namespace", srv.withAuth(srv.deleteNamespace))
-
-	// Roles - Moved to grpc
-	// DELETE IN 7.0
-	srv.POST("/:version/roles", srv.withAuth(srv.upsertRole))
-	srv.GET("/:version/roles", srv.withAuth(srv.getRoles))
-	srv.GET("/:version/roles/:role", srv.withAuth(srv.getRole))
-	srv.DELETE("/:version/roles/:role", srv.withAuth(srv.deleteRole))
 
 	// cluster configuration
 	srv.GET("/:version/configuration/name", srv.withAuth(srv.getClusterName))
@@ -225,6 +204,7 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.DELETE("/:version/saml/connectors/:id", srv.withAuth(srv.deleteSAMLConnector))
 	srv.POST("/:version/saml/requests/create", srv.withAuth(srv.createSAMLAuthRequest))
 	srv.POST("/:version/saml/requests/validate", srv.withAuth(srv.validateSAMLResponse))
+	srv.GET("/:version/saml/requests/get/:id", srv.withAuth(srv.getSAMLAuthRequest))
 
 	// Github connector
 	srv.POST("/:version/github/connectors", srv.withAuth(srv.createGithubConnector))
@@ -235,16 +215,8 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.POST("/:version/github/requests/create", srv.withAuth(srv.createGithubAuthRequest))
 	srv.POST("/:version/github/requests/validate", srv.withAuth(srv.validateGithubAuthCallback))
 
-	// U2F
-	// DELETE IN 9.x, superseded by /mfa/ endpoints (codingllama)
-	srv.GET("/:version/u2f/signuptokens/:token", srv.withAuth(srv.getSignupU2FRegisterRequest))
-	srv.POST("/:version/u2f/users/:user/sign", srv.withAuth(srv.mfaLoginBegin))
-	srv.GET("/:version/u2f/appid", srv.withAuth(srv.getU2FAppID))
-
-	// Generic MFA and WebAuthn
-	srv.POST("/:version/mfa/users/:user/login/begin", srv.withAuth(srv.mfaLoginBegin))
-	// The last step of MFA login is performed by either /ssh/authenticate or
-	// /web/authenticate endpoints.
+	// SSO diag info
+	srv.GET("/:version/sso/diag/:auth/:id", srv.withAuth(srv.getSSODiagnosticInfo))
 
 	// Provisioning tokens- Moved to grpc
 	// DELETE IN 8.0
@@ -253,7 +225,6 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 	srv.DELETE("/:version/tokens/:token", srv.withAuth(srv.deleteToken))
 
 	// Audit logs AKA events
-	srv.POST("/:version/events", srv.withAuth(srv.emitAuditEvent))
 	srv.GET("/:version/events", srv.withAuth(srv.searchEvents))
 	srv.GET("/:version/events/session", srv.withAuth(srv.searchSessionEvents))
 
@@ -572,7 +543,7 @@ func (s *APIServer) upsertReverseTunnel(auth ClientI, w http.ResponseWriter, r *
 
 // getReverseTunnels returns a list of reverse tunnels
 func (s *APIServer) getReverseTunnels(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	reverseTunnels, err := auth.GetReverseTunnels()
+	reverseTunnels, err := auth.GetReverseTunnels(r.Context())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -633,7 +604,7 @@ func (s *APIServer) validateTrustedCluster(auth ClientI, w http.ResponseWriter, 
 		return nil, trace.Wrap(err)
 	}
 
-	validateResponse, err := auth.ValidateTrustedCluster(validateRequest)
+	validateResponse, err := auth.ValidateTrustedCluster(r.Context(), validateRequest)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -742,51 +713,6 @@ func (s *APIServer) generateUserCert(auth ClientI, w http.ResponseWriter, r *htt
 	return string(certs.SSH), nil
 }
 
-type signInReq struct {
-	Password string `json:"password"`
-}
-
-// DELETE IN 9.0.0 in favor of grpc CreateAuthenticateChallenge.
-func (s *APIServer) mfaLoginBegin(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	var req *signInReq
-	if err := httplib.ReadJSON(r, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	user := p.ByName("user")
-	pass := []byte(req.Password)
-	protoChal, err := auth.CreateAuthenticateChallenge(r.Context(), &proto.CreateAuthenticateChallengeRequest{
-		Request: &proto.CreateAuthenticateChallengeRequest_UserCredentials{UserCredentials: &proto.UserCredentials{
-			Username: user,
-			Password: pass,
-		}},
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Convert from proto to JSON format.
-	chal := &MFAAuthenticateChallenge{
-		TOTPChallenge: protoChal.TOTP != nil,
-	}
-	for _, u2fChal := range protoChal.U2F {
-		ch := u2f.AuthenticateChallenge{
-			Version:   u2fChal.Version,
-			Challenge: u2fChal.Challenge,
-			KeyHandle: u2fChal.KeyHandle,
-			AppID:     u2fChal.AppID,
-		}
-		if chal.AuthenticateChallenge == nil {
-			chal.AuthenticateChallenge = &ch
-		}
-		chal.U2FChallenges = append(chal.U2FChallenges, ch)
-	}
-	if protoChal.WebauthnChallenge != nil {
-		chal.WebauthnChallenge = wanlib.CredentialAssertionFromProto(protoChal.WebauthnChallenge)
-	}
-
-	return chal, nil
-}
-
 type WebSessionReq struct {
 	// User is the user name associated with the session id.
 	User string `json:"user"`
@@ -813,7 +739,7 @@ func (s *APIServer) createWebSession(auth ClientI, w http.ResponseWriter, r *htt
 	}
 
 	if req.PrevSessionID != "" {
-		sess, err := auth.ExtendWebSession(req)
+		sess, err := auth.ExtendWebSession(r.Context(), req)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -962,28 +888,6 @@ func (s *APIServer) deleteUser(auth ClientI, w http.ResponseWriter, r *http.Requ
 	return message(fmt.Sprintf("user %q deleted", user)), nil
 }
 
-type generateKeyPairReq struct {
-	Password string `json:"password"`
-}
-
-type generateKeyPairResponse struct {
-	PrivKey []byte `json:"privkey"`
-	PubKey  string `json:"pubkey"`
-}
-
-func (s *APIServer) generateKeyPair(auth ClientI, w http.ResponseWriter, r *http.Request, _ httprouter.Params, version string) (interface{}, error) {
-	var req *generateKeyPairReq
-	if err := httplib.ReadJSON(r, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	priv, pub, err := auth.GenerateKeyPair(req.Password)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return &generateKeyPairResponse{PrivKey: priv, PubKey: string(pub)}, nil
-}
-
 type generateHostCertReq struct {
 	Key         []byte            `json:"key"`
 	HostID      string            `json:"hostname"`
@@ -1033,12 +937,12 @@ func (s *APIServer) registerUsingToken(auth ClientI, w http.ResponseWriter, r *h
 	// Pass along the remote address the request came from to the registration function.
 	req.RemoteAddr = r.RemoteAddr
 
-	certs, err := auth.RegisterUsingToken(req)
+	certs, err := auth.RegisterUsingToken(r.Context(), &req)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return LegacyCertsFromProto(certs), nil
+	return certs, nil
 }
 
 type registerNewAuthServerReq struct {
@@ -1057,59 +961,12 @@ func (s *APIServer) registerNewAuthServer(auth ClientI, w http.ResponseWriter, r
 	return message("ok"), nil
 }
 
-// DELETE IN 9.0 (zmb3)
-type legacyHostCertsRequest struct {
-	HostID               string            `json:"host_id"`
-	NodeName             string            `json:"node_name"`
-	Roles                types.SystemRoles `json:"roles"`
-	AdditionalPrincipals []string          `json:"additional_principals,omitempty"`
-	DNSNames             []string          `json:"dns_names,omitempty"`
-	PublicTLSKey         []byte            `json:"public_tls_key"`
-	PublicSSHKey         []byte            `json:"public_ssh_key"`
-	RemoteAddr           string            `json:"remote_addr"`
-	Rotation             *types.Rotation   `json:"rotation,omitempty"`
-}
-
-// DELETE IN 9.0 (zmb3) now available in GRPC server)
-func (s *APIServer) generateHostCerts(auth ClientI, w http.ResponseWriter, r *http.Request, _ httprouter.Params, version string) (interface{}, error) {
-	// We can't use proto.HostCertsRequest here, because this old API expects
-	// a list of roles with exactly one element, rather than a single role.
-	var req legacyHostCertsRequest
-	if err := httplib.ReadJSON(r, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	if len(req.Roles) != 1 {
-		return nil, trace.BadParameter("expected exactly one system role")
-	}
-
-	// Pass along the remote address the request came from to the registration function.
-	req.RemoteAddr = r.RemoteAddr
-
-	certs, err := auth.GenerateHostCerts(r.Context(), &proto.HostCertsRequest{
-		HostID:               req.HostID,
-		NodeName:             req.NodeName,
-		Role:                 req.Roles[0],
-		AdditionalPrincipals: req.AdditionalPrincipals,
-		DNSNames:             req.DNSNames,
-		PublicTLSKey:         req.PublicTLSKey,
-		PublicSSHKey:         req.PublicSSHKey,
-		RemoteAddr:           req.RemoteAddr,
-		Rotation:             req.Rotation,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return LegacyCertsFromProto(certs), nil
-}
-
 func (s *APIServer) rotateCertAuthority(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
 	var req RotateRequest
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := auth.RotateCertAuthority(req); err != nil {
+	if err := auth.RotateCertAuthority(r.Context(), req); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return message("ok"), nil
@@ -1154,7 +1011,7 @@ func (s *APIServer) rotateExternalCertAuthority(auth ClientI, w http.ResponseWri
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := auth.RotateExternalCertAuthority(ca); err != nil {
+	if err := auth.RotateExternalCertAuthority(r.Context(), ca); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return message("ok"), nil
@@ -1165,8 +1022,7 @@ func (s *APIServer) getCertAuthorities(auth ClientI, w http.ResponseWriter, r *h
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	certs, err := auth.GetCertAuthorities(types.CertAuthType(p.ByName("type")), loadKeys)
-
+	certs, err := auth.GetCertAuthorities(r.Context(), types.CertAuthType(p.ByName("type")), loadKeys)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1190,7 +1046,7 @@ func (s *APIServer) getCertAuthority(auth ClientI, w http.ResponseWriter, r *htt
 		Type:       types.CertAuthType(p.ByName("type")),
 		DomainName: p.ByName("domain"),
 	}
-	ca, err := auth.GetCertAuthority(id, loadKeys)
+	ca, err := auth.GetCertAuthority(r.Context(), id, loadKeys)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1215,58 +1071,6 @@ func (s *APIServer) getClusterCACert(auth ClientI, w http.ResponseWriter, r *htt
 	}
 
 	return localCA, nil
-}
-
-// DELETE IN 9.0.0: defined in grpcserver "ChangeUserAuthentication", kept for fallback.
-func (s *APIServer) changePasswordWithToken(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	var req ChangePasswordWithTokenRequest
-	if err := httplib.ReadJSON(r, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	protoReq := &proto.ChangeUserAuthenticationRequest{
-		TokenID:     req.TokenID,
-		NewPassword: req.Password,
-	}
-
-	if req.U2FRegisterResponse != nil {
-		protoReq.NewMFARegisterResponse = &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_U2F{
-			U2F: &proto.U2FRegisterResponse{
-				RegistrationData: req.U2FRegisterResponse.RegistrationData,
-				ClientData:       req.U2FRegisterResponse.ClientData,
-			},
-		}}
-	}
-
-	if req.SecondFactorToken != "" {
-		protoReq.NewMFARegisterResponse = &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_TOTP{
-			TOTP: &proto.TOTPRegisterResponse{Code: req.SecondFactorToken},
-		}}
-	}
-
-	res, err := auth.ChangeUserAuthentication(r.Context(), protoReq)
-	if err != nil {
-		log.Debugf("Failed to change user password with token: %v.", err)
-		return nil, trace.Wrap(err)
-	}
-
-	return rawMessage(services.MarshalWebSession(res.WebSession, services.WithVersion(version)))
-}
-
-// getU2FAppID returns the U2F AppID in the auth configuration
-func (s *APIServer) getU2FAppID(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	cap, err := auth.GetAuthPreference(r.Context())
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	universalSecondFactor, err := cap.GetU2F()
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	w.Header().Set("Content-Type", "application/fido.trusted-apps+json")
-	return universalSecondFactor.AppID, nil
 }
 
 func (s *APIServer) deleteCertAuthority(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
@@ -1354,24 +1158,6 @@ func (s *APIServer) getSession(auth ClientI, w http.ResponseWriter, r *http.Requ
 		return nil, trace.Wrap(err)
 	}
 	return se, nil
-}
-
-// DELETE IN 9.0.0 replaced by grpc CreateRegisterChallenge.
-func (s *APIServer) getSignupU2FRegisterRequest(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	token := p.ByName("token")
-	res, err := auth.CreateRegisterChallenge(r.Context(), &proto.CreateRegisterChallengeRequest{
-		TokenID:    token,
-		DeviceType: proto.DeviceType_DEVICE_TYPE_U2F,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return &u2f.RegisterChallenge{
-		Challenge: res.GetU2F().GetChallenge(),
-		AppID:     res.GetU2F().GetAppID(),
-		Version:   res.GetU2F().GetVersion(),
-	}, nil
 }
 
 type upsertOIDCConnectorRawReq struct {
@@ -1617,6 +1403,23 @@ func (s *APIServer) createSAMLAuthRequest(auth ClientI, w http.ResponseWriter, r
 	return response, nil
 }
 
+func (s *APIServer) getSAMLAuthRequest(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	request, err := auth.GetSAMLAuthRequest(r.Context(), p.ByName("id"))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	return request, nil
+}
+
+func (s *APIServer) getSSODiagnosticInfo(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
+	info, err := auth.GetSSODiagnosticInfo(r.Context(), p.ByName("auth"), p.ByName("id"))
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return info, nil
+}
+
 type validateSAMLResponseReq struct {
 	Response string `json:"response"`
 }
@@ -1646,7 +1449,7 @@ func (s *APIServer) validateSAMLResponse(auth ClientI, w http.ResponseWriter, r 
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	response, err := auth.ValidateSAMLResponse(req.Response)
+	response, err := auth.ValidateSAMLResponse(r.Context(), req.Response)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -1962,150 +1765,6 @@ func (s *APIServer) searchSessionEvents(auth ClientI, w http.ResponseWriter, r *
 	return eventsList, nil
 }
 
-type auditEventReq struct {
-	// Event is the event that's being emitted.
-	Event events.Event `json:"event"`
-	// Fields is the additional event fields.
-	Fields events.EventFields `json:"fields"`
-	// Type is the event type.
-	//
-	// This field is obsolete and kept for backwards compatibility.
-	Type string `json:"type"`
-}
-
-// HTTP	POST /:version/events
-func (s *APIServer) emitAuditEvent(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	var req auditEventReq
-	err := httplib.ReadJSON(r, &req)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Validate serverID field in event matches server ID from x509 identity. This
-	// check makes sure nodes can only submit events for themselves.
-	serverID, err := s.getServerID(r)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	err = events.ValidateEvent(req.Fields, serverID)
-	if err != nil {
-		log.Warnf("Rejecting audit event %v from %v: %v. System may be under attack, a "+
-			"node is attempting to submit events for an identity other than its own.",
-			req.Type, serverID, err)
-		return nil, trace.AccessDenied("failed to validate event")
-	}
-
-	// DELETE IN: 4.1.0.
-	//
-	// For backwards compatibility, check if the full event struct has
-	// been sent in the request or just the event type.
-	if req.Event.Name != "" {
-		err = auth.EmitAuditEventLegacy(req.Event, req.Fields)
-	} else {
-		err = auth.EmitAuditEventLegacy(events.Event{Name: req.Type}, req.Fields)
-	}
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return message("ok"), nil
-}
-
-// HTTP POST /:version/sessions/:id/slice
-func (s *APIServer) postSessionSlice(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	data, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	var slice events.SessionSlice
-	if err := slice.Unmarshal(data); err != nil {
-		return nil, trace.BadParameter("failed to unmarshal %v", err)
-	}
-
-	// Validate serverID field in event matches server ID from x509 identity. This
-	// check makes sure nodes can only submit events for themselves.
-	serverID, err := s.getServerID(r)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	for _, v := range slice.GetChunks() {
-		var f events.EventFields
-		err = utils.FastUnmarshal(v.GetData(), &f)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		err := events.ValidateEvent(f, serverID)
-		if err != nil {
-			log.Warnf("Rejecting audit event %v from %v: %v. System may be under attack, a "+
-				"node is attempting to submit events for an identity other than its own.",
-				f.GetType(), serverID, err)
-			return nil, trace.AccessDenied("failed to validate event")
-		}
-	}
-
-	if err := auth.PostSessionSlice(slice); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return message("ok"), nil
-}
-
-// HTTP POST /:version/sessions/:id/recording
-func (s *APIServer) uploadSessionRecording(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	var files form.Files
-	var namespace, sid string
-
-	err := form.Parse(r,
-		form.FileSlice("recording", &files),
-		form.String("namespace", &namespace, form.Required()),
-		form.String("sid", &sid, form.Required()),
-	)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-	if !types.IsValidNamespace(namespace) {
-		return nil, trace.BadParameter("invalid namespace %q", namespace)
-	}
-	if len(files) != 1 {
-		return nil, trace.BadParameter("expected a single file parameter but got %d", len(files))
-	}
-	defer files[0].Close()
-	_, err = session.ParseID(sid)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// Make a copy of the archive because it needs to be read twice: once to
-	// validate it and then again to upload it.
-	var buf bytes.Buffer
-	recording := io.TeeReader(files[0], &buf)
-
-	// Validate namespace and serverID fields in the archive match namespace and
-	// serverID of the authenticated client. This check makes sure nodes can
-	// only submit recordings for themselves.
-	serverID, err := s.getServerID(r)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	err = events.ValidateArchive(recording, serverID)
-	if err != nil {
-		log.Warnf("Rejecting session recording from %v: %v. System may be under attack, a "+
-			"node is attempting to submit events for an identity other than its own.",
-			serverID, err)
-		return nil, trace.BadParameter("failed to validate archive")
-	}
-
-	if err = auth.UploadSessionRecording(events.SessionRecording{
-		SessionID: session.ID(sid),
-		Namespace: namespace,
-		Recording: &buf,
-	}); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return message("ok"), nil
-}
-
 // HTTP GET /:version/sessions/:id/stream?offset=x&bytes=y
 // Query parameters:
 //   "offset"   : bytes from the beginning
@@ -2219,77 +1878,6 @@ func (s *APIServer) deleteNamespace(auth ClientI, w http.ResponseWriter, r *http
 
 type upsertRoleRawReq struct {
 	Role json.RawMessage `json:"role"`
-}
-
-// DELETE IN 7.0
-func (s *APIServer) upsertRole(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	var req *upsertRoleRawReq
-	if err := httplib.ReadJSON(r, &req); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	role, err := services.UnmarshalRole(req.Role)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	if err = services.ValidateRole(role); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	err = auth.UpsertRole(r.Context(), role)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return message(fmt.Sprintf("'%v' role upserted", role.GetName())), nil
-}
-
-// DELETE IN 7.0
-func (s *APIServer) getRole(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	role, err := auth.GetRole(r.Context(), p.ByName("role"))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	roleV4, ok := role.(*types.RoleV4)
-	if !ok {
-		return nil, trace.BadParameter("unrecognized role version")
-	}
-	downgraded, err := downgradeRole(context.Background(), roleV4)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return rawMessage(services.MarshalRole(downgraded, services.WithVersion(version), services.PreserveResourceID()))
-}
-
-// DELETE IN 7.0
-func (s *APIServer) getRoles(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	roles, err := auth.GetRoles(r.Context())
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	out := make([]json.RawMessage, len(roles))
-	for i, role := range roles {
-		roleV4, ok := role.(*types.RoleV4)
-		if !ok {
-			return nil, trace.BadParameter("unrecognized role version")
-		}
-		downgraded, err := downgradeRole(r.Context(), roleV4)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		raw, err := services.MarshalRole(downgraded, services.WithVersion(version), services.PreserveResourceID())
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		out[i] = raw
-	}
-	return out, nil
-}
-
-// DELETE IN 7.0
-func (s *APIServer) deleteRole(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
-	role := p.ByName("role")
-	if err := auth.DeleteRole(r.Context(), role); err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return message(fmt.Sprintf("role %q deleted", role)), nil
 }
 
 func (s *APIServer) getClusterName(auth ClientI, w http.ResponseWriter, r *http.Request, p httprouter.Params, version string) (interface{}, error) {
@@ -2562,29 +2150,6 @@ func (s *APIServer) processKubeCSR(auth ClientI, w http.ResponseWriter, r *http.
 	}
 
 	return re, nil
-}
-
-// getServerID returns the ID of the connected client.
-func (s *APIServer) getServerID(r *http.Request) (string, error) {
-	role, ok := r.Context().Value(ContextUser).(BuiltinRole)
-	if !ok {
-		return "", trace.BadParameter("invalid role %T", r.Context().Value(ContextUser))
-	}
-
-	clusterName, err := s.AuthServer.GetDomainName()
-	if err != nil {
-		return "", trace.Wrap(err)
-	}
-
-	// The username extracted from the node's identity (x.509 certificate)
-	// is expected to consist of "<server-id>.<cluster-name>" so strip the
-	// cluster name suffix to get the server id.
-	//
-	// Note that as of right now Teleport expects server id to be a uuid4
-	// but older Gravity clusters used to override it with strings like
-	// "192_168_1_1.<cluster-name>" so this code can't rely on it being
-	// uuid4 to account for clusters upgraded from older versions.
-	return strings.TrimSuffix(role.Username, "."+clusterName), nil
 }
 
 func message(msg string) map[string]interface{} {

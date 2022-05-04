@@ -20,9 +20,9 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -37,7 +37,6 @@ import (
 	"github.com/gravitational/teleport/lib"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
-	"github.com/gravitational/teleport/lib/backend/memory"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/limiter"
@@ -64,7 +63,7 @@ var testConfigs testConfigFiles
 func writeTestConfigs() error {
 	var err error
 
-	testConfigs.tempDir, err = ioutil.TempDir("", "teleport-config")
+	testConfigs.tempDir, err = os.MkdirTemp("", "teleport-config")
 	if err != nil {
 		return err
 	}
@@ -107,35 +106,113 @@ func TestMain(m *testing.M) {
 	os.Exit(res)
 }
 
-func TestConfig(t *testing.T) {
-	t.Run("SampleConfig", func(t *testing.T) {
-		// generate sample config and write it into a temp file:
-		sfc, err := MakeSampleFileConfig(SampleFlags{
-			ClusterName: "cookie.localhost",
-			ACMEEnabled: true,
-			ACMEEmail:   "alice@example.com",
-			LicensePath: "/tmp/license.pem",
+func TestSampleConfig(t *testing.T) {
+	testCases := []struct {
+		name                   string
+		input                  SampleFlags
+		expectError            bool
+		expectClusterName      ClusterName
+		expectLicenseFile      string
+		expectProxyPublicAddrs apiutils.Strings
+		expectProxyWebAddr     string
+		expectProxyKeyPairs    []KeyPair
+	}{
+		{
+			name: "ACMEEnabled",
+			input: SampleFlags{
+				ClusterName: "cookie.localhost",
+				ACMEEnabled: true,
+				ACMEEmail:   "alice@example.com",
+				LicensePath: "/tmp/license.pem",
+			},
+			expectClusterName:      ClusterName("cookie.localhost"),
+			expectLicenseFile:      "/tmp/license.pem",
+			expectProxyPublicAddrs: apiutils.Strings{"cookie.localhost:443"},
+			expectProxyWebAddr:     "0.0.0.0:443",
+		},
+		{
+			name: "public and web addr",
+			input: SampleFlags{
+				PublicAddr: "tele.example.com:4422",
+			},
+			expectProxyPublicAddrs: apiutils.Strings{"tele.example.com:4422"},
+			expectProxyWebAddr:     "0.0.0.0:4422",
+		},
+		{
+			name: "public and web addr with default port",
+			input: SampleFlags{
+				PublicAddr: "tele.example.com",
+			},
+			expectProxyPublicAddrs: apiutils.Strings{"tele.example.com:443"},
+			expectProxyWebAddr:     "0.0.0.0:443",
+		},
+		{
+			name: "key file missing",
+			input: SampleFlags{
+				CertFile: "/var/lib/teleport/fullchain.pem",
+			},
+			expectError: true,
+		},
+		{
+			name: "load x509 key pair failed",
+			input: SampleFlags{
+				KeyFile:  "/var/lib/teleport/key.pem",
+				CertFile: "/var/lib/teleport/fullchain.pem",
+			},
+			expectError: true,
+		},
+		{
+			name: "cluster name missing",
+			input: SampleFlags{
+				ACMEEnabled: true,
+			},
+			expectError: true,
+		},
+		{
+			name: "ACMEEnabled conflict with key file",
+			input: SampleFlags{
+				ClusterName: "cookie.localhost",
+				ACMEEnabled: true,
+				KeyFile:     "/var/lib/teleport/privkey.pem",
+				CertFile:    "/var/lib/teleport/fullchain.pem",
+			},
+			expectError: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			sfc, err := MakeSampleFileConfig(testCase.input)
+
+			if testCase.expectError {
+				require.Error(t, err)
+				require.Nil(t, sfc)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, sfc)
+
+			fn := filepath.Join(t.TempDir(), "default-config.yaml")
+			err = os.WriteFile(fn, []byte(sfc.DebugDumpToYAML()), 0660)
+			require.NoError(t, err)
+
+			// make sure it could be parsed:
+			fc, err := ReadFromFile(fn)
+			require.NoError(t, err)
+
+			// validate a couple of values:
+			require.Equal(t, fc.Global.DataDir, defaults.DataDir)
+			require.Equal(t, fc.Logger.Severity, "INFO")
+			require.Equal(t, testCase.expectClusterName, fc.Auth.ClusterName)
+			require.Equal(t, testCase.expectLicenseFile, fc.Auth.LicenseFile)
+			require.Equal(t, testCase.expectProxyWebAddr, fc.Proxy.WebAddr)
+			require.ElementsMatch(t, testCase.expectProxyPublicAddrs, fc.Proxy.PublicAddr)
+			require.ElementsMatch(t, testCase.expectProxyKeyPairs, fc.Proxy.KeyPairs)
+
+			require.False(t, lib.IsInsecureDevMode())
 		})
-		require.NoError(t, err)
-		require.NotNil(t, sfc)
-		fn := filepath.Join(t.TempDir(), "default-config.yaml")
-		err = os.WriteFile(fn, []byte(sfc.DebugDumpToYAML()), 0660)
-		require.NoError(t, err)
-
-		// make sure it could be parsed:
-		fc, err := ReadFromFile(fn)
-		require.NoError(t, err)
-
-		// validate a couple of values:
-		require.Equal(t, defaults.DataDir, fc.Global.DataDir)
-		require.Equal(t, "INFO", fc.Logger.Severity)
-		require.Equal(t, fc.Auth.ClusterName, ClusterName("cookie.localhost"))
-		require.Equal(t, fc.Auth.LicenseFile, "/tmp/license.pem")
-		require.Equal(t, fc.Proxy.PublicAddr, apiutils.Strings{"cookie.localhost:443"})
-		require.Equal(t, fc.Proxy.WebAddr, "0.0.0.0:443")
-
-		require.False(t, lib.IsInsecureDevMode())
-	})
+	}
 }
 
 // TestBooleanParsing tests that boolean options
@@ -352,7 +429,9 @@ func TestConfigReading(t *testing.T) {
 					Certificate: "/etc/teleport/proxy.crt",
 				},
 			},
-			CACerts: []string{"/etc/teleport/ca.crt"},
+			CACerts:           []string{"/etc/teleport/ca.crt"},
+			GRPCServerLatency: true,
+			GRPCClientLatency: true,
 		},
 		WindowsDesktop: WindowsDesktopService{
 			Service: Service{
@@ -391,27 +470,6 @@ func TestConfigReading(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, conf)
 	checkStaticConfig(t, conf)
-}
-
-func TestReadLDAPPasswordFromFile(t *testing.T) {
-	tmp := t.TempDir()
-	passwordFile := filepath.Join(tmp, "ldap-password")
-	require.NoError(t, os.WriteFile(passwordFile, []byte(" super-secret-password\n"), 0644))
-
-	fc := FileConfig{
-		WindowsDesktop: WindowsDesktopService{
-			LDAP: LDAPConfig{
-				Addr:         "test.example.com",
-				Domain:       "example.com",
-				Username:     "admin",
-				PasswordFile: passwordFile,
-			},
-		},
-	}
-
-	var sc service.Config
-	require.NoError(t, applyWindowsDesktopConfig(&fc, &sc))
-	require.Equal(t, "super-secret-password", sc.WindowsDesktop.LDAP.Password)
 }
 
 func TestLabelParsing(t *testing.T) {
@@ -601,14 +659,17 @@ func TestApplyConfig(t *testing.T) {
 	require.Equal(t, "tcp://webhost:3080", cfg.Proxy.WebAddr.FullAddress())
 	require.Equal(t, "tcp://tunnelhost:1001", cfg.Proxy.ReverseTunnelListenAddr.FullAddress())
 	require.Equal(t, "tcp://webhost:3336", cfg.Proxy.MySQLAddr.FullAddress())
+	require.Equal(t, "tcp://webhost:27017", cfg.Proxy.MongoAddr.FullAddress())
 	require.Len(t, cfg.Proxy.PostgresPublicAddrs, 1)
 	require.Equal(t, "tcp://postgres.example:5432", cfg.Proxy.PostgresPublicAddrs[0].FullAddress())
 	require.Len(t, cfg.Proxy.MySQLPublicAddrs, 1)
 	require.Equal(t, "tcp://mysql.example:3306", cfg.Proxy.MySQLPublicAddrs[0].FullAddress())
+	require.Len(t, cfg.Proxy.MongoPublicAddrs, 1)
+	require.Equal(t, "tcp://mongo.example:27017", cfg.Proxy.MongoPublicAddrs[0].FullAddress())
 
 	require.Equal(t, "tcp://127.0.0.1:3000", cfg.DiagnosticAddr.FullAddress())
 
-	u2fCAFromFile, err := ioutil.ReadFile("testdata/u2f_attestation_ca.pem")
+	u2fCAFromFile, err := os.ReadFile("testdata/u2f_attestation_ca.pem")
 	require.NoError(t, err)
 	require.Empty(t, cmp.Diff(cfg.Auth.Preference, &types.AuthPreferenceV2{
 		Kind:    types.KindClusterAuthPreference,
@@ -651,6 +712,7 @@ SREzU8onbBsjMg9QDiSf5oJLKvd/Ren+zGY7
 			AllowLocalAuth:        types.NewBoolOption(true),
 			DisconnectExpiredCert: types.NewBoolOption(false),
 			LockingMode:           constants.LockingModeBestEffort,
+			AllowPasswordless:     types.NewBoolOption(false),
 		},
 	}))
 
@@ -733,6 +795,28 @@ func TestPostgresPublicAddr(t *testing.T) {
 				},
 			},
 			out: []string{net.JoinHostPort("postgres.example.com", strconv.Itoa(defaults.HTTPListenPort))},
+		},
+		{
+			desc: "when PostgresAddr is provided with port, the explicitly provided port should be use",
+			fc: &FileConfig{
+				Proxy: Proxy{
+					WebAddr:            "0.0.0.0:8080",
+					PostgresAddr:       "0.0.0.0:12345",
+					PostgresPublicAddr: []string{"postgres.example.com"},
+				},
+			},
+			out: []string{"postgres.example.com:12345"},
+		},
+		{
+			desc: "when PostgresAddr is provided without port, defaults PostgresPort should be used",
+			fc: &FileConfig{
+				Proxy: Proxy{
+					WebAddr:            "0.0.0.0:8080",
+					PostgresAddr:       "0.0.0.0",
+					PostgresPublicAddr: []string{"postgres.example.com"},
+				},
+			},
+			out: []string{net.JoinHostPort("postgres.example.com", strconv.Itoa(defaults.PostgresListenPort))},
 		},
 	}
 	for _, test := range tests {
@@ -837,12 +921,11 @@ func TestParseCachePolicy(t *testing.T) {
 		out *service.CachePolicy
 		err error
 	}{
-		{in: &CachePolicy{EnabledFlag: "yes", TTL: "never"}, out: &service.CachePolicy{Enabled: true, Type: lite.GetName()}},
-		{in: &CachePolicy{EnabledFlag: "yes", TTL: "10h"}, out: &service.CachePolicy{Enabled: true, Type: lite.GetName()}},
-		{in: &CachePolicy{Type: memory.GetName(), EnabledFlag: "false", TTL: "10h"}, out: &service.CachePolicy{Enabled: false, Type: memory.GetName()}},
-		{in: &CachePolicy{Type: memory.GetName(), EnabledFlag: "yes", TTL: "never"}, out: &service.CachePolicy{Enabled: true, Type: memory.GetName()}},
-		{in: &CachePolicy{EnabledFlag: "no"}, out: &service.CachePolicy{Type: lite.GetName(), Enabled: false}},
-		{in: &CachePolicy{Type: "memsql"}, err: trace.BadParameter("unsupported backend")},
+		{in: &CachePolicy{EnabledFlag: "yes", TTL: "never"}, out: &service.CachePolicy{Enabled: true}},
+		{in: &CachePolicy{EnabledFlag: "true", TTL: "10h"}, out: &service.CachePolicy{Enabled: true}},
+		{in: &CachePolicy{Type: "whatever", EnabledFlag: "false", TTL: "10h"}, out: &service.CachePolicy{Enabled: false}},
+		{in: &CachePolicy{Type: "name", EnabledFlag: "yes", TTL: "never"}, out: &service.CachePolicy{Enabled: true}},
+		{in: &CachePolicy{EnabledFlag: "no"}, out: &service.CachePolicy{Enabled: false}},
 	}
 	for i, tc := range tcs {
 		comment := fmt.Sprintf("test case #%v", i)
@@ -1081,6 +1164,8 @@ func makeConfigFixture() string {
 	// Metrics service.
 	conf.Metrics.EnabledFlag = "yes"
 	conf.Metrics.ListenAddress = "tcp://metrics"
+	conf.Metrics.GRPCServerLatency = true
+	conf.Metrics.GRPCClientLatency = true
 	conf.Metrics.CACerts = []string{"/etc/teleport/ca.crt"}
 	conf.Metrics.KeyPairs = []KeyPair{
 		{
@@ -1447,10 +1532,6 @@ func TestProxyConfigurationVersion(t *testing.T) {
 func TestWindowsDesktopService(t *testing.T) {
 	t.Parallel()
 
-	tmp := t.TempDir()
-	ldapPasswordFile := filepath.Join(tmp, "ldap-pass")
-	require.NoError(t, os.WriteFile(ldapPasswordFile, []byte("foo"), 0644))
-
 	for _, test := range []struct {
 		desc        string
 		mutate      func(fc *FileConfig)
@@ -1495,13 +1576,7 @@ func TestWindowsDesktopService(t *testing.T) {
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
-			fc := &FileConfig{
-				WindowsDesktop: WindowsDesktopService{
-					LDAP: LDAPConfig{
-						PasswordFile: ldapPasswordFile,
-					},
-				},
-			}
+			fc := &FileConfig{}
 			test.mutate(fc)
 			cfg := &service.Config{}
 			err := applyWindowsDesktopConfig(fc, cfg)
@@ -1632,23 +1707,25 @@ func TestAppsCLF(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		clf := CommandLineFlags{
-			Roles:   tt.inRoles,
-			AppName: tt.inAppName,
-			AppURI:  tt.inAppURI,
-		}
-		cfg := service.MakeDefaultConfig()
-		err := Configure(&clf, cfg)
-		if err != nil {
-			require.IsType(t, err, tt.outError, tt.desc)
-		} else {
-			require.NoError(t, err, tt.desc)
-		}
-		if tt.outError != nil {
-			continue
-		}
-		require.True(t, cfg.Apps.Enabled, tt.desc)
-		require.Len(t, cfg.Apps.Apps, 1, tt.desc)
+		t.Run(tt.desc, func(t *testing.T) {
+			clf := CommandLineFlags{
+				Roles:   tt.inRoles,
+				AppName: tt.inAppName,
+				AppURI:  tt.inAppURI,
+			}
+			cfg := service.MakeDefaultConfig()
+			err := Configure(&clf, cfg)
+			if err != nil {
+				require.IsType(t, err, tt.outError)
+			} else {
+				require.NoError(t, err)
+			}
+			if tt.outError != nil {
+				return
+			}
+			require.True(t, cfg.Apps.Enabled)
+			require.Len(t, cfg.Apps.Apps, 1)
+		})
 	}
 }
 
@@ -1779,6 +1856,9 @@ func TestDatabaseCLIFlags(t *testing.T) {
 						Command: []string{"hostname"},
 					},
 				},
+				TLS: service.DatabaseTLS{
+					Mode: service.VerifyFull,
+				},
 			},
 		},
 		{
@@ -1825,6 +1905,9 @@ func TestDatabaseCLIFlags(t *testing.T) {
 				StaticLabels: map[string]string{
 					types.OriginLabel: types.OriginConfigFile},
 				DynamicLabels: services.CommandLabels{},
+				TLS: service.DatabaseTLS{
+					Mode: service.VerifyFull,
+				},
 			},
 		},
 		{
@@ -1849,6 +1932,9 @@ func TestDatabaseCLIFlags(t *testing.T) {
 				StaticLabels: map[string]string{
 					types.OriginLabel: types.OriginConfigFile},
 				DynamicLabels: services.CommandLabels{},
+				TLS: service.DatabaseTLS{
+					Mode: service.VerifyFull,
+				},
 			},
 		},
 		{
@@ -1865,7 +1951,10 @@ func TestDatabaseCLIFlags(t *testing.T) {
 				Name:     "gcp",
 				Protocol: defaults.ProtocolPostgres,
 				URI:      "localhost:5432",
-				CACert:   fixtures.LocalhostCert,
+				TLS: service.DatabaseTLS{
+					Mode:   service.VerifyFull,
+					CACert: fixtures.LocalhostCert,
+				},
 				GCP: service.DatabaseGCP{
 					ProjectID:  "gcp-project-1",
 					InstanceID: "gcp-instance-1",
@@ -1875,18 +1964,74 @@ func TestDatabaseCLIFlags(t *testing.T) {
 				DynamicLabels: services.CommandLabels{},
 			},
 		},
+		{
+			desc: "SQL Server",
+			inFlags: CommandLineFlags{
+				DatabaseName:         "sqlserver",
+				DatabaseProtocol:     defaults.ProtocolSQLServer,
+				DatabaseURI:          "localhost:1433",
+				DatabaseADKeytabFile: "/etc/keytab",
+				DatabaseADDomain:     "EXAMPLE.COM",
+				DatabaseADSPN:        "MSSQLSvc/sqlserver.example.com:1433",
+			},
+			outDatabase: service.Database{
+				Name:     "sqlserver",
+				Protocol: defaults.ProtocolSQLServer,
+				URI:      "localhost:1433",
+				TLS: service.DatabaseTLS{
+					Mode: service.VerifyFull,
+				},
+				AD: service.DatabaseAD{
+					KeytabFile: "/etc/keytab",
+					Krb5File:   defaults.Krb5FilePath,
+					Domain:     "EXAMPLE.COM",
+					SPN:        "MSSQLSvc/sqlserver.example.com:1433",
+				},
+				StaticLabels: map[string]string{
+					types.OriginLabel: types.OriginConfigFile},
+				DynamicLabels: services.CommandLabels{},
+			},
+		},
+		{
+			desc: "MySQL version",
+			inFlags: CommandLineFlags{
+				DatabaseName:               "mysql-foo",
+				DatabaseProtocol:           defaults.ProtocolMySQL,
+				DatabaseURI:                "localhost:3306",
+				DatabaseMySQLServerVersion: "8.0.28",
+			},
+			outDatabase: service.Database{
+				Name:     "mysql-foo",
+				Protocol: defaults.ProtocolMySQL,
+				URI:      "localhost:3306",
+				MySQL: service.MySQLOptions{
+					ServerVersion: "8.0.28",
+				},
+				TLS: service.DatabaseTLS{
+					Mode: service.VerifyFull,
+				},
+				StaticLabels: map[string]string{
+					types.OriginLabel: types.OriginConfigFile},
+				DynamicLabels: services.CommandLabels{},
+			},
+		},
 	}
+
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.desc, func(t *testing.T) {
+			t.Parallel()
+
 			config := service.MakeDefaultConfig()
 			err := Configure(&tt.inFlags, config)
 			if tt.outError != "" {
 				require.Contains(t, err.Error(), tt.outError)
 			} else {
 				require.NoError(t, err)
-				require.Equal(t, []service.Database{
-					tt.outDatabase,
-				}, config.Databases.Databases)
+				require.Equal(t,
+					config.Databases.Databases,
+					[]service.Database{tt.outDatabase},
+				)
 			}
 		})
 	}
@@ -1912,7 +2057,7 @@ func TestTextFormatter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.comment, func(t *testing.T) {
-			formatter := &textFormatter{
+			formatter := &utils.TextFormatter{
 				ExtraFields: tt.formatConfig,
 			}
 			tt.assertErr(t, formatter.CheckAndSetDefaults())
@@ -1940,10 +2085,74 @@ func TestJSONFormatter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.comment, func(t *testing.T) {
-			formatter := &jsonFormatter{
-				extraFields: tt.extraFields,
+			formatter := &utils.JSONFormatter{
+				ExtraFields: tt.extraFields,
 			}
 			tt.assertErr(t, formatter.CheckAndSetDefaults())
+		})
+	}
+}
+
+func TestTLSCert(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpCA := path.Join(tmpDir, "ca.pem")
+
+	err := os.WriteFile(tmpCA, fixtures.LocalhostCert, 0644)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		conf *FileConfig
+	}{
+		{
+			"read deprecated DB cert field",
+			&FileConfig{
+				Databases: Databases{
+					Service: Service{
+						EnabledFlag: "true",
+					},
+					Databases: []*Database{
+						{
+							Name:       "test-db-1",
+							Protocol:   "mysql",
+							URI:        "localhost:1234",
+							CACertFile: tmpCA,
+						},
+					},
+				},
+			},
+		},
+		{
+			"read DB cert field",
+			&FileConfig{
+				Databases: Databases{
+					Service: Service{
+						EnabledFlag: "true",
+					},
+					Databases: []*Database{
+						{
+							Name:     "test-db-1",
+							Protocol: "mysql",
+							URI:      "localhost:1234",
+							TLS: DatabaseTLS{
+								CACertFile: tmpCA,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := service.MakeDefaultConfig()
+
+			err = ApplyFileConfig(tt.conf, cfg)
+			require.NoError(t, err)
+
+			require.Len(t, cfg.Databases.Databases, 1)
+			require.Equal(t, fixtures.LocalhostCert, cfg.Databases.Databases[0].TLS.CACert)
 		})
 	}
 }

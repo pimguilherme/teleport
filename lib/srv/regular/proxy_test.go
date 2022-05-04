@@ -21,10 +21,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv"
-	"github.com/stretchr/testify/require"
 )
 
 func TestParseProxyRequest(t *testing.T) {
@@ -129,10 +131,27 @@ func TestParseBadRequests(t *testing.T) {
 	}
 }
 
+type nodeGetter struct {
+	servers []types.Server
+}
+
+func (n nodeGetter) GetNodes(fn func(n services.Node) bool) []types.Server {
+	var servers []types.Server
+	for _, s := range n.servers {
+		if fn(s) {
+			servers = append(servers, s)
+		}
+	}
+
+	return servers
+}
+
 func TestProxySubsys_getMatchingServer(t *testing.T) {
 	t.Parallel()
 
 	serverUUID := uuid.NewString()
+
+	ec2NodeID := "123456789012-i-abcdef12345678901"
 
 	setExpiry := func(time time.Time) func(server types.Server) {
 		return func(server types.Server) {
@@ -164,6 +183,10 @@ func TestProxySubsys_getMatchingServer(t *testing.T) {
 		}, setExpiry(time.Now().Add(time.Hour*24))),
 		createServer("server3", types.ServerSpecV2{
 			Hostname: serverUUID,
+			Addr:     "127.0.0.1:",
+		}),
+		createServer(ec2NodeID, types.ServerSpecV2{
+			Hostname: "localhost",
 			Addr:     "127.0.0.1:",
 		}),
 	}
@@ -199,6 +222,17 @@ func TestProxySubsys_getMatchingServer(t *testing.T) {
 			servers: servers,
 			req: proxySubsysRequest{
 				host: serverUUID,
+			},
+		},
+		{
+			desc:        "Match by EC2 ID",
+			expectError: require.NoError,
+			expectServer: func(servers []types.Server) types.Server {
+				return servers[3]
+			},
+			servers: servers,
+			req: proxySubsysRequest{
+				host: ec2NodeID,
 			},
 		},
 		{
@@ -295,7 +329,7 @@ func TestProxySubsys_getMatchingServer(t *testing.T) {
 				srv:                &Server{},
 			}
 
-			server, err := subsystem.getMatchingServer(tt.servers, tt.strategy)
+			server, err := subsystem.getMatchingServer(nodeGetter{tt.servers}, tt.strategy)
 			tt.expectError(t, err)
 			if tt.expectServer != nil {
 				require.Equal(t, tt.expectServer(tt.servers), server)

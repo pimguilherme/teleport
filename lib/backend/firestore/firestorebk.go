@@ -23,10 +23,12 @@ import (
 
 	"cloud.google.com/go/firestore"
 	apiv1 "cloud.google.com/go/firestore/apiv1/admin"
+	"github.com/gravitational/trace/trail"
 	"google.golang.org/api/option"
 	adminpb "google.golang.org/genproto/googleapis/firestore/admin/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"github.com/gravitational/teleport/api/types"
@@ -94,7 +96,6 @@ func (cfg *backendConfig) CheckAndSetDefaults() error {
 type Backend struct {
 	*log.Entry
 	backendConfig
-	backend.NoMigrations
 	// svc is the primary Firestore client
 	svc *firestore.Client
 	// clock is the
@@ -201,6 +202,8 @@ const (
 	idDocProperty = "id"
 	// timeInBetweenIndexCreationStatusChecks
 	timeInBetweenIndexCreationStatusChecks = time.Second * 10
+	// commitLimit is the maximum number of writes per commit
+	commitLimit = 500
 )
 
 // GetName is a part of backend API and it returns Firestore backend type
@@ -218,7 +221,7 @@ func CreateFirestoreClients(ctx context.Context, projectID string, endPoint stri
 	var args []option.ClientOption
 
 	if len(endPoint) != 0 {
-		args = append(args, option.WithoutAuthentication(), option.WithEndpoint(endPoint), option.WithGRPCDialOption(grpc.WithInsecure()))
+		args = append(args, option.WithoutAuthentication(), option.WithEndpoint(endPoint), option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())))
 	} else if len(credentialsFile) != 0 {
 		args = append(args, option.WithCredentialsFile(credentialsFile))
 	}
@@ -357,7 +360,7 @@ func (b *Backend) getRangeDocs(ctx context.Context, startKey []byte, endKey []by
 		return nil, trace.BadParameter("missing parameter endKey")
 	}
 	if limit <= 0 {
-		limit = backend.DefaultLargeLimit
+		limit = backend.DefaultRangeLimit
 	}
 	docs, err := b.svc.Collection(b.CollectionName).
 		Where(keyDocProperty, ">=", startKey).
@@ -375,7 +378,12 @@ func (b *Backend) getRangeDocs(ctx context.Context, startKey []byte, endKey []by
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return append(docs, legacyDocs...), nil
+
+	allDocs := append(docs, legacyDocs...)
+	if len(allDocs) >= backend.DefaultRangeLimit {
+		b.Warnf("Range query hit backend limit. (this is a bug!) startKey=%q,limit=%d", startKey, backend.DefaultRangeLimit)
+	}
+	return allDocs, nil
 }
 
 // GetRange returns range of elements
@@ -406,23 +414,12 @@ func (b *Backend) GetRange(ctx context.Context, startKey []byte, endKey []byte, 
 
 // DeleteRange deletes range of items with keys between startKey and endKey
 func (b *Backend) DeleteRange(ctx context.Context, startKey, endKey []byte) error {
-	docSnaps, err := b.getRangeDocs(ctx, startKey, endKey, backend.DefaultLargeLimit)
+	docs, err := b.getRangeDocs(ctx, startKey, endKey, backend.DefaultRangeLimit)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if len(docSnaps) == 0 {
-		// Nothing to delete.
-		return nil
-	}
-	batch := b.svc.Batch()
-	for _, docSnap := range docSnaps {
-		batch.Delete(docSnap.Ref)
-	}
-	_, err = batch.Commit(ctx)
-	if err != nil {
-		return ConvertGRPCError(err)
-	}
-	return nil
+
+	return trace.Wrap(b.deleteDocuments(docs))
 }
 
 // Get returns a single item or not found error
@@ -701,21 +698,35 @@ func (b *Backend) purgeExpiredDocuments() error {
 			return b.clientContext.Err()
 		case <-t.C:
 			expiryTime := b.clock.Now().UTC().Unix()
-			numDeleted := 0
-			batch := b.svc.Batch()
-			docs, _ := b.svc.Collection(b.CollectionName).Where(expiresDocProperty, "<=", expiryTime).Documents(b.clientContext).GetAll()
-			for _, doc := range docs {
-				batch.Delete(doc.Ref)
-				numDeleted++
+			docs, err := b.svc.Collection(b.CollectionName).Where(expiresDocProperty, "<=", expiryTime).Documents(b.clientContext).GetAll()
+			if err != nil {
+				b.Logger.WithError(trail.FromGRPC(err)).Warn("Failed to get expired documents")
+				continue
 			}
-			if numDeleted > 0 {
-				_, err := batch.Commit(b.clientContext)
-				if err != nil {
-					return ConvertGRPCError(err)
-				}
+
+			if err := b.deleteDocuments(docs); err != nil {
+				return trace.Wrap(err)
 			}
 		}
 	}
+}
+
+// deleteDocuments removes documents from firestore in batches to stay within the
+// firestore write limits
+func (b *Backend) deleteDocuments(docs []*firestore.DocumentSnapshot) error {
+	for i := 0; i < len(docs); i += commitLimit {
+		batch := b.svc.Batch()
+
+		for j := 0; j < commitLimit && i+j < len(docs); j++ {
+			batch.Delete(docs[i+j].Ref)
+		}
+
+		if _, err := batch.Commit(b.clientContext); err != nil {
+			return ConvertGRPCError(err)
+		}
+	}
+
+	return nil
 }
 
 // ConvertGRPCError converts GRPC errors

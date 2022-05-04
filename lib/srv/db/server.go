@@ -30,18 +30,24 @@ import (
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/labels"
+	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/srv/db/cloud"
 	"github.com/gravitational/teleport/lib/srv/db/common"
-	"github.com/gravitational/teleport/lib/srv/db/mongodb"
 	"github.com/gravitational/teleport/lib/srv/db/mysql"
-	"github.com/gravitational/teleport/lib/srv/db/postgres"
 	"github.com/gravitational/teleport/lib/utils"
 
+	// Import to register MongoDB engine.
+	_ "github.com/gravitational/teleport/lib/srv/db/mongodb"
+	// Import to register MySQL engine.
+	_ "github.com/gravitational/teleport/lib/srv/db/mysql"
+	// Import to register Postgres engine.
+	_ "github.com/gravitational/teleport/lib/srv/db/postgres"
+
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/pborman/uuid"
 	"github.com/sirupsen/logrus"
 )
 
@@ -61,6 +67,8 @@ type Config struct {
 	NewAudit NewAuditFn
 	// TLSConfig is the *tls.Config for this server.
 	TLSConfig *tls.Config
+	// Limiter limits the number of connections per client IP.
+	Limiter *limiter.Limiter
 	// Authorizer is used to authorize requests coming from proxy.
 	Authorizer auth.Authorizer
 	// GetRotation returns the certificate rotation state.
@@ -169,6 +177,13 @@ func (c *Config) CheckAndSetDefaults(ctx context.Context) (err error) {
 			return trace.Wrap(err)
 		}
 	}
+	if c.Limiter == nil {
+		// Use default limiter if nothing is provided. Connection limiting will be disabled.
+		c.Limiter, err = limiter.NewLimiter(limiter.Config{})
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	}
 	return nil
 }
 
@@ -231,10 +246,10 @@ func (m *monitoredDatabases) setCloud(databases types.Databases) {
 	m.cloud = databases
 }
 
-func (m *monitoredDatabases) get() types.ResourcesWithLabels {
+func (m *monitoredDatabases) get() types.ResourcesWithLabelsMap {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append(append(m.static, m.resources...), m.cloud...).AsResources()
+	return append(append(m.static, m.resources...), m.cloud...).AsResources().ToMap()
 }
 
 // New returns a new database server.
@@ -266,7 +281,9 @@ func New(ctx context.Context, config Config) (*Server, error) {
 	// Update TLS config to require client certificate.
 	server.cfg.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
 	server.cfg.TLSConfig.GetConfigForClient = getConfigForClient(
-		server.cfg.TLSConfig, server.cfg.AccessPoint, server.log)
+		server.cfg.TLSConfig, server.cfg.AccessPoint, server.log,
+		// TODO: Remove UserCA in Teleport 11.
+		types.UserCA, types.DatabaseCA)
 
 	return server, nil
 }
@@ -298,6 +315,10 @@ func (s *Server) startDatabase(ctx context.Context, database types.Database) err
 	// on the defined schedule.
 	if err := s.startDynamicLabels(ctx, database); err != nil {
 		return trace.Wrap(err)
+	}
+	if err := fetchMySQLVersion(ctx, database); err != nil {
+		// Log, but do not fail. We will fetch the version later.
+		s.log.Warnf("Failed to fetch the MySQL version for %s: %v", database.GetName(), err)
 	}
 	// Heartbeat will periodically report the presence of this proxied database
 	// to the auth server.
@@ -559,6 +580,12 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		return trace.Wrap(err)
 	}
 
+	// If the agent doesn’t have any static databases configured, send a
+	// heartbeat without error to make the component “ready”.
+	if len(s.cfg.Databases) == 0 && s.cfg.OnHeartbeat != nil {
+		s.cfg.OnHeartbeat(nil)
+	}
+
 	return nil
 }
 
@@ -568,7 +595,8 @@ func (s *Server) Close() error {
 	// Stop proxying all databases.
 	for _, database := range s.getProxiedDatabases() {
 		if err := s.stopProxyingDatabase(s.closeContext, database); err != nil {
-			errors = append(errors, err)
+			errors = append(errors, trace.WrapWithMessage(
+				err, "stopping database %v", database.GetName()))
 		}
 	}
 	// Signal to all goroutines to stop.
@@ -585,7 +613,10 @@ func (s *Server) Close() error {
 // Wait will block while the server is running.
 func (s *Server) Wait() error {
 	<-s.closeContext.Done()
-	return s.closeContext.Err()
+	if err := s.closeContext.Err(); err != nil && err != context.Canceled {
+		return trace.Wrap(err)
+	}
+	return nil
 }
 
 // ForceHeartbeat is used by tests to force-heartbeat all registered databases.
@@ -613,7 +644,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	// Make sure to close the upgraded connection, not "conn", otherwise
 	// the other side may not detect that connection has closed.
 	defer tlsConn.Close()
-	// Perform the hanshake explicitly, normally it should be performed
+	// Perform the handshake explicitly, normally it should be performed
 	// on the first read/write but when the connection is passed over
 	// reverse tunnel it doesn't happen for some reason.
 	err := tlsConn.Handshake()
@@ -637,11 +668,12 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	}
 }
 
-func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
+func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) error {
 	sessionCtx, err := s.authorize(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
 	streamWriter, err := s.newStreamWriter(sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
@@ -649,7 +681,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
 	defer func() {
 		// Closing the stream writer is needed to flush all recorded data
 		// and trigger upload. Do it in a goroutine since depending on
-		// session size it can take a while and we don't want to block
+		// session size it can take a while, and we don't want to block
 		// the client.
 		go func() {
 			// Use the server closing context to make sure that upload
@@ -660,15 +692,25 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
 			}
 		}()
 	}()
-	engine, err := s.dispatch(sessionCtx, streamWriter)
+	engine, err := s.dispatch(sessionCtx, streamWriter, clientConn)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Warnf("Recovered while handling DB connection from %v: %v.", clientConn.RemoteAddr(), r)
+			err = trace.BadParameter("failed to handle client connection")
+		}
+		if err != nil {
+			engine.SendError(err)
+		}
+	}()
+
 	// Wrap a client connection into monitor that auto-terminates
 	// idle connection and connection with expired cert.
-	conn, err = monitorConn(ctx, monitorConnConfig{
-		conn:         conn,
+	clientConn, err = monitorConn(ctx, monitorConnConfig{
+		conn:         clientConn,
 		lockWatcher:  s.cfg.LockWatcher,
 		lockTargets:  sessionCtx.LockTargets,
 		identity:     sessionCtx.Identity,
@@ -685,50 +727,60 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
 		return trace.Wrap(err)
 	}
 
-	err = engine.HandleConnection(ctx, sessionCtx, conn)
+	// TODO(jakule): ClientIP should be required starting from 10.0.
+	clientIP := sessionCtx.Identity.ClientIP
+	if clientIP != "" {
+		s.log.Debugf("Real client IP %s", clientIP)
+
+		var release func()
+		release, err = s.cfg.Limiter.RegisterRequestAndConnection(clientIP)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		defer release()
+	} else {
+		s.log.Debug("ClientIP is not set (Proxy Service has to be updated). Rate limiting is disabled.")
+	}
+
+	err = engine.HandleConnection(ctx, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	return nil
 }
 
-// dispatch returns an appropriate database engine for the session.
-func (s *Server) dispatch(sessionCtx *common.Session, streamWriter events.StreamWriter) (common.Engine, error) {
+// dispatch creates and initializes an appropriate database engine for the session.
+func (s *Server) dispatch(sessionCtx *common.Session, streamWriter events.StreamWriter, clientConn net.Conn) (common.Engine, error) {
 	audit, err := s.cfg.NewAudit(common.AuditConfig{
 		Emitter: streamWriter,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	switch sessionCtx.Database.GetProtocol() {
-	case defaults.ProtocolPostgres, defaults.ProtocolCockroachDB:
-		return &postgres.Engine{
-			Auth:    s.cfg.Auth,
-			Audit:   audit,
-			Context: s.closeContext,
-			Clock:   s.cfg.Clock,
-			Log:     sessionCtx.Log,
-		}, nil
-	case defaults.ProtocolMySQL:
-		return &mysql.Engine{
-			Auth:       s.cfg.Auth,
-			Audit:      audit,
-			AuthClient: s.cfg.AuthClient,
-			Context:    s.closeContext,
-			Clock:      s.cfg.Clock,
-			Log:        sessionCtx.Log,
-		}, nil
-	case defaults.ProtocolMongoDB:
-		return &mongodb.Engine{
-			Auth:    s.cfg.Auth,
-			Audit:   audit,
-			Context: s.closeContext,
-			Clock:   s.cfg.Clock,
-			Log:     sessionCtx.Log,
-		}, nil
+	engine, err := s.createEngine(sessionCtx, audit)
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
-	return nil, trace.BadParameter("unsupported database protocol %q",
-		sessionCtx.Database.GetProtocol())
+
+	if err := engine.InitializeConnection(clientConn, sessionCtx); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return engine, nil
+}
+
+// createEngine creates a new database engine based on the database protocol.
+// An error is returned when a protocol is not supported.
+func (s *Server) createEngine(sessionCtx *common.Session, audit common.Audit) (common.Engine, error) {
+	return common.GetEngine(sessionCtx.Database.GetProtocol(), common.EngineConfig{
+		Auth:         s.cfg.Auth,
+		Audit:        audit,
+		AuthClient:   s.cfg.AuthClient,
+		CloudClients: s.cfg.CloudClients,
+		Context:      s.closeContext,
+		Clock:        s.cfg.Clock,
+		Log:          sessionCtx.Log,
+	})
 }
 
 func (s *Server) authorize(ctx context.Context) (*common.Session, error) {
@@ -761,7 +813,7 @@ func (s *Server) authorize(ctx context.Context) (*common.Session, error) {
 	}
 	s.log.Debugf("Will connect to database %q at %v.", database.GetName(),
 		database.GetURI())
-	id := uuid.New()
+	id := uuid.New().String()
 	return &common.Session{
 		ID:                id,
 		ClusterName:       identity.RouteToCluster,
@@ -772,11 +824,39 @@ func (s *Server) authorize(ctx context.Context) (*common.Session, error) {
 		DatabaseName:      identity.RouteToDatabase.Database,
 		Checker:           authContext.Checker,
 		StartupParameters: make(map[string]string),
-		Statements:        common.NewStatementsCache(),
 		Log: s.log.WithFields(logrus.Fields{
 			"id": id,
 			"db": database.GetName(),
 		}),
 		LockTargets: authContext.LockTargets(),
 	}, nil
+}
+
+// fetchMySQLVersion tries to connect to MySQL instance, read initial handshake package and extract
+// the server version.
+func fetchMySQLVersion(ctx context.Context, database types.Database) error {
+	if database.GetProtocol() != defaults.ProtocolMySQL || database.GetMySQLServerVersion() != "" {
+		return nil
+	}
+
+	// Try to extract the engine version for AWS metadata labels.
+	if database.IsRDS() {
+		version := services.GetMySQLEngineVersion(database.GetMetadata().Labels)
+		if version != "" {
+			database.SetMySQLServerVersion(version)
+			return nil
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 7*time.Second)
+	defer cancel()
+
+	version, err := mysql.FetchMySQLVersion(ctx, database)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	database.SetMySQLServerVersion(version)
+
+	return nil
 }

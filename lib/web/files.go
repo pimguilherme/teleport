@@ -19,8 +19,8 @@ package web
 import (
 	"net/http"
 
+	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/reversetunnel"
 	"github.com/gravitational/teleport/lib/sshutils/scp"
@@ -50,23 +50,19 @@ func (h *Handler) transferFile(w http.ResponseWriter, r *http.Request, p httprou
 	req := fileTransferRequest{
 		cluster:        p.ByName("site"),
 		login:          p.ByName("login"),
-		namespace:      p.ByName("namespace"),
 		server:         p.ByName("server"),
 		remoteLocation: query.Get("location"),
 		filename:       query.Get("filename"),
-	}
-
-	clt, err := ctx.GetUserClient(site)
-	if err != nil {
-		return nil, trace.Wrap(err)
+		namespace:      defaults.Namespace,
 	}
 
 	ft := fileTransfer{
 		ctx:           ctx,
-		authClient:    clt,
+		site:          site,
 		proxyHostPort: h.ProxyHostPort(),
 	}
 
+	var err error
 	isUpload := r.Method == http.MethodPost
 	if isUpload {
 		err = ft.upload(req, r)
@@ -84,7 +80,7 @@ func (h *Handler) transferFile(w http.ResponseWriter, r *http.Request, p httprou
 type fileTransfer struct {
 	// ctx is a web session context for the currently logged in user.
 	ctx           *SessionContext
-	authClient    auth.ClientI
+	site          reversetunnel.RemoteSite
 	proxyHostPort string
 }
 
@@ -144,12 +140,12 @@ func (f *fileTransfer) createClient(req fileTransferRequest, httpReq *http.Reque
 		return nil, trace.BadParameter("missing login")
 	}
 
-	servers, err := f.authClient.GetNodes(httpReq.Context(), req.namespace)
+	watcher, err := f.site.NodeWatcher()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	hostName, hostPort, err := resolveServerHostPort(req.server, servers)
+	hostName, hostPort, err := resolveServerHostPort(req.server, watcher)
 	if err != nil {
 		return nil, trace.BadParameter("invalid server name %q: %v", req.server, err)
 	}

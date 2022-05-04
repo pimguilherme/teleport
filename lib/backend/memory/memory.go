@@ -113,10 +113,13 @@ func New(cfg Config) (*Memory, error) {
 
 // Memory is a memory B-Tree based backend
 type Memory struct {
+	// nextID is a next record ID
+	// intentionally placed first to ensure 64-bit alignment
+	nextID int64
+
 	*sync.Mutex
 	*log.Entry
 	Config
-	backend.NoMigrations
 	// tree is a BTree with items
 	tree *btree.BTree
 	// heap is a min heap with expiry records
@@ -127,8 +130,6 @@ type Memory struct {
 	// ctx is a context signalling close
 	ctx context.Context
 	buf *backend.CircularBuffer
-	//  nextID is a next record ID
-	nextID int64
 }
 
 // Close closes memory backend
@@ -324,12 +325,15 @@ func (m *Memory) GetRange(ctx context.Context, startKey []byte, endKey []byte, l
 		return nil, trace.BadParameter("missing parameter endKey")
 	}
 	if limit <= 0 {
-		limit = backend.DefaultLargeLimit
+		limit = backend.DefaultRangeLimit
 	}
 	m.Lock()
 	defer m.Unlock()
 	m.removeExpired()
 	re := m.getRange(ctx, startKey, endKey, limit)
+	if len(re.Items) == backend.DefaultRangeLimit {
+		m.Warnf("Range query hit backend limit. (this is a bug!) startKey=%q,limit=%d", startKey, backend.DefaultRangeLimit)
+	}
 	return &re, nil
 }
 

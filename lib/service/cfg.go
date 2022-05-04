@@ -17,6 +17,7 @@ limitations under the License.
 package service
 
 import (
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -41,7 +42,6 @@ import (
 	"github.com/gravitational/teleport/lib/auth/keystore"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/lite"
-	"github.com/gravitational/teleport/lib/backend/memory"
 	"github.com/gravitational/teleport/lib/bpf"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
@@ -52,7 +52,9 @@ import (
 	restricted "github.com/gravitational/teleport/lib/restrictedsession"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/app/common"
+	"github.com/gravitational/teleport/lib/srv/db/redis"
 	"github.com/gravitational/teleport/lib/sshca"
+	"github.com/gravitational/teleport/lib/sshutils/x11"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 
@@ -61,13 +63,20 @@ import (
 	"github.com/jonboulle/clockwork"
 )
 
+// Rate describes a rate ratio, i.e. the number of "events" that happen over
+// some unit time period
+type Rate struct {
+	Amount int
+	Time   time.Duration
+}
+
 // Config structure is used to initialize _all_ services Teleport can run.
 // Some settings are global (like DataDir) while others are grouped into
 // sections, like AuthConfig
 type Config struct {
 	// Teleport configuration version.
 	Version string
-	// DataDir provides directory where teleport stores it's permanent state
+	// DataDir is the directory where teleport stores its permanent state
 	// (in case of auth server backed by BoltDB) or local state, e.g. keys
 	DataDir string
 
@@ -78,7 +87,7 @@ type Config struct {
 	Token string
 
 	// JoinMethod is the method the instance will use to join the auth server
-	JoinMethod JoinMethod
+	JoinMethod types.JoinMethod
 
 	// AuthServers is a list of auth servers, proxies and peer auth servers to
 	// connect to. Yes, this is not just auth servers, the field name is
@@ -94,7 +103,7 @@ type Config struct {
 	AdvertiseIP string
 
 	// CachePolicy sets caching policy for nodes and proxies
-	// in case if they loose connection to auth servers
+	// in case if they lose connection to auth servers
 	CachePolicy CachePolicy
 
 	// Auth service configuration. Manages cluster state and configuration.
@@ -230,6 +239,25 @@ type Config struct {
 
 	// PluginRegistry allows adding enterprise logic to Teleport services
 	PluginRegistry plugin.Registry
+
+	// RotationConnectionInterval is the interval between connection
+	// attempts as used by the rotation state service
+	RotationConnectionInterval time.Duration
+
+	// RestartThreshold describes the number of connection failures per
+	// unit time that the node can sustain before restarting itself, as
+	// measured by the rotation state service.
+	RestartThreshold Rate
+
+	// MaxRetryPeriod is the maximum period between reconnection attempts to auth
+	MaxRetryPeriod time.Duration
+
+	// ConnectFailureC is a channel to notify of failures to connect to auth (used in tests).
+	ConnectFailureC chan time.Duration
+
+	// TeleportHome is the path to tsh configuration and data, used
+	// for loading profiles when TELEPORT_HOME is set
+	TeleportHome string
 }
 
 // ApplyToken assigns a given token to all internal services but only if token
@@ -279,31 +307,21 @@ func (cfg *Config) DebugDumpToYAML() string {
 
 // CachePolicy sets caching policy for proxies and nodes
 type CachePolicy struct {
-	// Type sets the cache type
-	Type string
 	// Enabled enables or disables caching
 	Enabled bool
 }
 
 // CheckAndSetDefaults checks and sets default values
 func (c *CachePolicy) CheckAndSetDefaults() error {
-	switch c.Type {
-	case "", lite.GetName():
-		c.Type = lite.GetName()
-	case memory.GetName():
-	default:
-		return trace.BadParameter("unsupported cache type %q, supported values are %q and %q",
-			c.Type, lite.GetName(), memory.GetName())
-	}
 	return nil
 }
 
 // String returns human-friendly representation of the policy
 func (c CachePolicy) String() string {
 	if !c.Enabled {
-		return "no cache policy"
+		return "no cache"
 	}
-	return fmt.Sprintf("%v cache will store frequently accessed items", c.Type)
+	return "in-memory cache"
 }
 
 // ProxyConfig specifies configuration for proxy service
@@ -341,15 +359,21 @@ type ProxyConfig struct {
 	// MySQLAddr is address of MySQL proxy.
 	MySQLAddr utils.NetAddr
 
+	// PostgresAddr is address of Postgres proxy.
+	PostgresAddr utils.NetAddr
+
+	// MongoAddr is address of Mongo proxy.
+	MongoAddr utils.NetAddr
+
 	Limiter limiter.Config
 
 	// PublicAddrs is a list of the public addresses the proxy advertises
-	// for the HTTP endpoint. The hosts in in PublicAddr are included in the
+	// for the HTTP endpoint. The hosts in PublicAddr are included in the
 	// list of host principals on the TLS and SSH certificate.
 	PublicAddrs []utils.NetAddr
 
 	// SSHPublicAddrs is a list of the public addresses the proxy advertises
-	// for the SSH endpoint. The hosts in in PublicAddr are included in the
+	// for the SSH endpoint. The hosts in PublicAddr are included in the
 	// list of host principals on the TLS and SSH certificate.
 	SSHPublicAddrs []utils.NetAddr
 
@@ -365,6 +389,10 @@ type ProxyConfig struct {
 	// MySQLPublicAddrs is a list of the public addresses the proxy
 	// advertises for MySQL clients.
 	MySQLPublicAddrs []utils.NetAddr
+
+	// MongoPublicAddrs is a list of the public addresses the proxy
+	// advertises for Mongo clients.
+	MongoPublicAddrs []utils.NetAddr
 
 	// Kube specifies kubernetes proxy configuration
 	Kube KubeProxyConfig
@@ -535,6 +563,9 @@ type SSHConfig struct {
 	// the inactivity timeout expiring. The empty string indicates that no
 	// timeout message will be sent.
 	IdleTimeoutMessage string
+
+	// X11 holds x11 forwarding configuration for Teleport.
+	X11 *x11.ServerConfig
 }
 
 // KubeConfig specifies configuration for kubernetes service
@@ -579,6 +610,8 @@ type DatabasesConfig struct {
 	ResourceMatchers []services.ResourceMatcher
 	// AWSMatchers match AWS hosted databases.
 	AWSMatchers []services.AWSMatcher
+	// Limiter limits the connection and request rates.
+	Limiter limiter.Config
 }
 
 // Database represents a single database that's being proxied.
@@ -593,14 +626,77 @@ type Database struct {
 	URI string
 	// StaticLabels is a map of database static labels.
 	StaticLabels map[string]string
+	// MySQL are additional MySQL database options.
+	MySQL MySQLOptions
 	// DynamicLabels is a list of database dynamic labels.
 	DynamicLabels services.CommandLabels
-	// CACert is an optional database CA certificate.
-	CACert []byte
+	// TLS keeps database connection TLS configuration.
+	TLS DatabaseTLS
 	// AWS contains AWS specific settings for RDS/Aurora/Redshift databases.
 	AWS DatabaseAWS
 	// GCP contains GCP specific settings for Cloud SQL databases.
 	GCP DatabaseGCP
+	// AD contains Active Directory configuration for database.
+	AD DatabaseAD
+}
+
+// TLSMode defines all possible database verification modes.
+type TLSMode string
+
+const (
+	// VerifyFull is the strictest. Verifies certificate and server name.
+	VerifyFull TLSMode = "verify-full"
+	// VerifyCA checks the certificate, but skips the server name verification.
+	VerifyCA TLSMode = "verify-ca"
+	// Insecure accepts any certificate.
+	Insecure TLSMode = "insecure"
+)
+
+// AllTLSModes keeps all possible database TLS modes for easy access.
+var AllTLSModes = []TLSMode{VerifyFull, VerifyCA, Insecure}
+
+// CheckAndSetDefaults check if TLSMode holds a correct value. If the value is not set
+// VerifyFull is set as a default. BadParameter error is returned if value set is incorrect.
+func (m *TLSMode) CheckAndSetDefaults() error {
+	switch *m {
+	case "": // Use VerifyFull if not set.
+		*m = VerifyFull
+	case VerifyFull, VerifyCA, Insecure:
+		// Correct value, do nothing.
+	default:
+		return trace.BadParameter("provided incorrect TLSMode value. Correct values are: %v", AllTLSModes)
+	}
+
+	return nil
+}
+
+// ToProto returns a matching protobuf type or VerifyFull for empty value.
+func (m TLSMode) ToProto() types.DatabaseTLSMode {
+	switch m {
+	case VerifyCA:
+		return types.DatabaseTLSMode_VERIFY_CA
+	case Insecure:
+		return types.DatabaseTLSMode_INSECURE
+	default: // VerifyFull
+		return types.DatabaseTLSMode_VERIFY_FULL
+	}
+}
+
+// MySQLOptions are additional MySQL options.
+type MySQLOptions struct {
+	// ServerVersion is the version reported by Teleport DB Proxy on initial handshake.
+	ServerVersion string
+}
+
+// DatabaseTLS keeps TLS settings used when connecting to database.
+type DatabaseTLS struct {
+	// Mode is the TLS connection mode. See TLSMode for more details.
+	Mode TLSMode
+	// ServerName allows providing custom server name.
+	// This name will override DNS name when validating certificate presented by the database.
+	ServerName string
+	// CACert is an optional database CA certificate.
+	CACert []byte
 }
 
 // DatabaseAWS contains AWS specific settings for RDS/Aurora databases.
@@ -633,6 +729,35 @@ type DatabaseGCP struct {
 	ProjectID string
 	// InstanceID is the Cloud SQL instance ID.
 	InstanceID string
+}
+
+// DatabaseAD contains database Active Directory configuration.
+type DatabaseAD struct {
+	// KeytabFile is the path to the Kerberos keytab file.
+	KeytabFile string
+	// Krb5File is the path to the Kerberos configuration file. Defaults to /etc/krb5.conf.
+	Krb5File string
+	// Domain is the Active Directory domain the database resides in.
+	Domain string
+	// SPN is the service principal name for the database.
+	SPN string
+}
+
+// CheckAndSetDefaults validates database Active Directory configuration.
+func (d *DatabaseAD) CheckAndSetDefaults(name string) error {
+	if d.KeytabFile == "" {
+		return trace.BadParameter("missing keytab file path for database %q", name)
+	}
+	if d.Krb5File == "" {
+		d.Krb5File = defaults.Krb5FilePath
+	}
+	if d.Domain == "" {
+		return trace.BadParameter("missing Active Directory domain for database %q", name)
+	}
+	if d.SPN == "" {
+		return trace.BadParameter("missing service principal name for database %q", name)
+	}
+	return nil
 }
 
 // CheckAndSetDefaults validates the database proxy configuration.
@@ -672,16 +797,25 @@ func (d *Database) CheckAndSetDefaults() error {
 					d.Name, connString.ReadPreference)
 			}
 		}
+	} else if d.Protocol == defaults.ProtocolRedis {
+		_, err := redis.ParseRedisAddress(d.URI)
+		if err != nil {
+			return trace.BadParameter("invalid Redis database %q address: %q, error: %v", d.Name, d.URI, err)
+		}
 	} else if _, _, err := net.SplitHostPort(d.URI); err != nil {
 		return trace.BadParameter("invalid database %q address %q: %v",
 			d.Name, d.URI, err)
 	}
-	if len(d.CACert) != 0 {
-		if _, err := tlsca.ParseCertificatePEM(d.CACert); err != nil {
+	if len(d.TLS.CACert) != 0 {
+		if _, err := tlsca.ParseCertificatePEM(d.TLS.CACert); err != nil {
 			return trace.BadParameter("provided database %q CA doesn't appear to be a valid x509 certificate: %v",
 				d.Name, err)
 		}
 	}
+	if err := d.TLS.Mode.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	// Validate Cloud SQL specific configuration.
 	switch {
 	case d.GCP.ProjectID != "" && d.GCP.InstanceID == "":
@@ -689,6 +823,14 @@ func (d *Database) CheckAndSetDefaults() error {
 	case d.GCP.ProjectID == "" && d.GCP.InstanceID != "":
 		return trace.BadParameter("missing Cloud SQL project ID for database %q", d.Name)
 	}
+
+	// For SQL Server we only support Kerberos auth with Active Directory at the moment.
+	if d.Protocol == defaults.ProtocolSQLServer {
+		if err := d.AD.CheckAndSetDefaults(d.Name); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
 	return nil
 }
 
@@ -805,6 +947,12 @@ type MetricsConfig struct {
 	// use for mTLS.
 	// Used in conjunction with MTLS = true
 	CACerts []string
+
+	// GRPCServerLatency enables histogram metrics for each grpc endpoint on the auth server
+	GRPCServerLatency bool
+
+	// GRPCServerLatency enables histogram metrics for each grpc endpoint on the auth server
+	GRPCClientLatency bool
 }
 
 // WindowsDesktopConfig specifies the configuration for the Windows Desktop
@@ -875,8 +1023,10 @@ type LDAPConfig struct {
 	Domain string
 	// Username for LDAP authentication.
 	Username string
-	// Password for LDAP authentication.
-	Password string
+	// InsecureSkipVerify decides whether whether we skip verifying with the LDAP server's CA when making the LDAPS connection.
+	InsecureSkipVerify bool
+	// CA is an optional CA cert to be used for verification if InsecureSkipVerify is set to false.
+	CA *x509.Certificate
 }
 
 // Rewrite is a list of rewriting rules to apply to requests and responses.
@@ -1009,6 +1159,7 @@ func ApplyDefaults(cfg *Config) {
 
 	// Databases proxy service is disabled by default.
 	cfg.Databases.Enabled = false
+	defaults.ConfigureLimiter(&cfg.Databases.Limiter)
 
 	// Metrics service defaults.
 	cfg.Metrics.Enabled = false
@@ -1016,6 +1167,14 @@ func ApplyDefaults(cfg *Config) {
 	// Windows desktop service is disabled by default.
 	cfg.WindowsDesktop.Enabled = false
 	defaults.ConfigureLimiter(&cfg.WindowsDesktop.ConnLimiter)
+
+	cfg.RotationConnectionInterval = defaults.HighResPollingPeriod
+	cfg.RestartThreshold = Rate{
+		Amount: defaults.MaxConnectionErrorsBeforeRestart,
+		Time:   defaults.ConnectionErrorMeasurementPeriod,
+	}
+	cfg.MaxRetryPeriod = defaults.MaxWatcherBackoff
+	cfg.ConnectFailureC = make(chan time.Duration, 1)
 }
 
 // ApplyFIPSDefaults updates default configuration to be FedRAMP/FIPS 140-2
@@ -1038,14 +1197,3 @@ func ApplyFIPSDefaults(cfg *Config) {
 	// entire cluster is FedRAMP/FIPS 140-2 compliant.
 	cfg.Auth.SessionRecordingConfig.SetMode(types.RecordAtNode)
 }
-
-// JoinMethod is the method the instance will use to join the auth server.
-type JoinMethod int
-
-const (
-	// JoinMethodToken means the instance will use a basic token.
-	JoinMethodToken JoinMethod = iota
-	// JoinMethodEC2 means the instance will use Simplified Node Joining and send an
-	// EC2 Instance Identity Document.
-	JoinMethodEC2
-)

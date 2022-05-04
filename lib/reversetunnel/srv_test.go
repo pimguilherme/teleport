@@ -17,6 +17,8 @@ limitations under the License.
 package reversetunnel
 
 import (
+	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -28,7 +30,6 @@ import (
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/utils"
-	"github.com/gravitational/teleport/lib/utils/testlog"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
@@ -37,7 +38,7 @@ import (
 
 func TestServerKeyAuth(t *testing.T) {
 	ta := testauthority.New()
-	priv, pub, err := ta.GenerateKeyPair("")
+	priv, pub, err := ta.GenerateKeyPair()
 	require.NoError(t, err)
 	caSigner, err := ssh.ParsePrivateKey(priv)
 	require.NoError(t, err)
@@ -58,7 +59,7 @@ func TestServerKeyAuth(t *testing.T) {
 	require.NoError(t, err)
 
 	s := &server{
-		log: testlog.FailureOnly(t),
+		log: utils.NewLoggerForTests(),
 		localAccessPoint: mockAccessPoint{
 			ca: ca,
 		},
@@ -156,6 +157,73 @@ type mockAccessPoint struct {
 	ca types.CertAuthority
 }
 
-func (ap mockAccessPoint) GetCertAuthority(id types.CertAuthID, loadKeys bool, opts ...services.MarshalOption) (types.CertAuthority, error) {
+func (ap mockAccessPoint) GetCertAuthority(ctx context.Context, id types.CertAuthID, loadKeys bool, opts ...services.MarshalOption) (types.CertAuthority, error) {
 	return ap.ca, nil
+}
+
+func TestCreateRemoteAccessPoint(t *testing.T) {
+	cases := []struct {
+		name           string
+		version        string
+		assertion      require.ErrorAssertionFunc
+		oldRemoteProxy bool
+	}{
+		{
+			name:      "invalid version",
+			assertion: require.Error,
+		},
+		{
+			name:      "remote running 9.0.0",
+			assertion: require.NoError,
+			version:   "9.0.0",
+		},
+		{
+			name:      "remote running 8.0.0",
+			assertion: require.NoError,
+			version:   "8.0.0",
+		},
+		{
+			name:           "remote running 7.0.0",
+			assertion:      require.NoError,
+			version:        "7.0.0",
+			oldRemoteProxy: true,
+		},
+		{
+			name:           "remote running 6.0.0",
+			assertion:      require.NoError,
+			version:        "6.0.0",
+			oldRemoteProxy: true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			newProxyFn := func(clt auth.ClientI, cacheName []string) (auth.RemoteProxyAccessPoint, error) {
+				if tt.oldRemoteProxy {
+					return nil, errors.New("expected to create an old remote proxy")
+				}
+
+				return nil, nil
+			}
+
+			oldProxyFn := func(clt auth.ClientI, cacheName []string) (auth.RemoteProxyAccessPoint, error) {
+				if !tt.oldRemoteProxy {
+					return nil, errors.New("expected to create an new remote proxy")
+				}
+
+				return nil, nil
+			}
+
+			clt := &mockAuthClient{}
+			srv := &server{
+				log: utils.NewLoggerForTests(),
+				Config: Config{
+					NewCachingAccessPoint:         newProxyFn,
+					NewCachingAccessPointOldProxy: oldProxyFn,
+				},
+			}
+			_, err := createRemoteAccessPoint(srv, clt, tt.version, "test")
+			tt.assertion(t, err)
+		})
+	}
 }

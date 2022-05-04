@@ -54,22 +54,18 @@ func (s *NativeSuite) SetUpSuite(c *check.C) {
 
 	a := New(
 		context.TODO(),
-		PrecomputeKeys(1),
 		SetClock(fakeClock),
 	)
 
 	s.suite = &test.AuthSuite{
-		A:     a,
-		Clock: fakeClock,
+		A:      a,
+		Keygen: GenerateKeyPair,
+		Clock:  fakeClock,
 	}
 }
 
 func (s *NativeSuite) TestGenerateKeypairEmptyPass(c *check.C) {
 	s.suite.GenerateKeypairEmptyPass(c)
-}
-
-func (s *NativeSuite) TestGenerateKeypairPass(c *check.C) {
-	s.suite.GenerateKeypairPass(c)
 }
 
 func (s *NativeSuite) TestGenerateHostCert(c *check.C) {
@@ -78,16 +74,6 @@ func (s *NativeSuite) TestGenerateHostCert(c *check.C) {
 
 func (s *NativeSuite) TestGenerateUserCert(c *check.C) {
 	s.suite.GenerateUserCert(c)
-}
-
-// TestDisablePrecompute makes sure that keygen works
-// when no keys are precomputed
-func (s *NativeSuite) TestDisablePrecompute(c *check.C) {
-	a := New(context.TODO(), PrecomputeKeys(0))
-
-	caPrivateKey, _, err := a.GenerateKeyPair("")
-	c.Assert(err, check.IsNil)
-	c.Assert(caPrivateKey, check.NotNil)
 }
 
 // TestBuildPrincipals makes sure that the list of principals for a host
@@ -100,13 +86,13 @@ func (s *NativeSuite) TestDisablePrecompute(c *check.C) {
 //     on the certificate.
 //   * If the host ID and node name are the same, only list one.
 func (s *NativeSuite) TestBuildPrincipals(c *check.C) {
-	caPrivateKey, _, err := s.suite.A.GenerateKeyPair("")
+	caPrivateKey, _, err := GenerateKeyPair()
 	c.Assert(err, check.IsNil)
 
 	caSigner, err := ssh.ParsePrivateKey(caPrivateKey)
 	c.Assert(err, check.IsNil)
 
-	_, hostPublicKey, err := s.suite.A.GenerateKeyPair("")
+	_, hostPublicKey, err := GenerateKeyPair()
 	c.Assert(err, check.IsNil)
 
 	tests := []struct {
@@ -197,7 +183,7 @@ func (s *NativeSuite) TestBuildPrincipals(c *check.C) {
 // TestUserCertCompatibility makes sure the compatibility flag can be used to
 // add to remove roles from certificate extensions.
 func (s *NativeSuite) TestUserCertCompatibility(c *check.C) {
-	priv, pub, err := s.suite.A.GenerateKeyPair("")
+	priv, pub, err := GenerateKeyPair()
 	c.Assert(err, check.IsNil)
 
 	caSigner, err := ssh.ParsePrivateKey(priv)
@@ -224,13 +210,20 @@ func (s *NativeSuite) TestUserCertCompatibility(c *check.C) {
 		comment := check.Commentf("Test %v", i)
 
 		userCertificateBytes, err := s.suite.A.GenerateUserCert(services.UserCertParams{
-			CASigner:              caSigner,
-			CASigningAlg:          defaults.CASignatureAlgorithm,
-			PublicUserKey:         pub,
-			Username:              "user",
-			AllowedLogins:         []string{"centos", "root"},
-			TTL:                   time.Hour,
-			Roles:                 []string{"foo"},
+			CASigner:      caSigner,
+			CASigningAlg:  defaults.CASignatureAlgorithm,
+			PublicUserKey: pub,
+			Username:      "user",
+			AllowedLogins: []string{"centos", "root"},
+			TTL:           time.Hour,
+			Roles:         []string{"foo"},
+			CertificateExtensions: []*types.CertExtension{{
+				Type:  types.CertExtensionType_SSH,
+				Mode:  types.CertExtensionMode_EXTENSION,
+				Name:  "login@github.com",
+				Value: "hello",
+			},
+			},
 			CertificateFormat:     tt.inCompatibility,
 			PermitAgentForwarding: true,
 			PermitPortForwarding:  true,
@@ -244,5 +237,8 @@ func (s *NativeSuite) TestUserCertCompatibility(c *check.C) {
 		// check if we added the roles extension
 		_, ok := userCertificate.Extensions[teleport.CertExtensionTeleportRoles]
 		c.Assert(ok, check.Equals, tt.outHasRoles, comment)
+		// check if users custom extension was added
+		extVal := userCertificate.Extensions["login@github.com"]
+		c.Assert(extVal, check.Equals, "hello")
 	}
 }

@@ -43,9 +43,9 @@ import (
 
 	apiv1 "cloud.google.com/go/firestore/apiv1/admin"
 
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
-	"github.com/pborman/uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -324,7 +324,7 @@ func (l *Log) EmitAuditEvent(ctx context.Context, in apievents.AuditEvent) error
 	} else {
 		// no session id - global event gets a random uuid to get a good partition
 		// key distribution
-		sessionID = uuid.New()
+		sessionID = uuid.New().String()
 	}
 
 	event := event{
@@ -343,85 +343,6 @@ func (l *Log) EmitAuditEvent(ctx context.Context, in apievents.AuditEvent) error
 		return firestorebk.ConvertGRPCError(err)
 	}
 	return nil
-}
-
-// EmitAuditEventLegacy emits audit event
-func (l *Log) EmitAuditEventLegacy(ev events.Event, fields events.EventFields) error {
-	sessionID := fields.GetString(events.SessionEventID)
-	eventIndex := fields.GetInt(events.EventIndex)
-	// no session id - global event gets a random uuid to get a good partition
-	// key distribution
-	if sessionID == "" {
-		sessionID = uuid.New()
-	}
-	err := events.UpdateEventFields(ev, fields, l.Clock, l.UIDGenerator)
-	if err != nil {
-		log.Error(trace.DebugReport(err))
-	}
-	created := fields.GetTime(events.EventTime)
-	if created.IsZero() {
-		created = l.Clock.Now().UTC()
-	}
-	data, err := json.Marshal(fields)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	event := event{
-		SessionID:      sessionID,
-		EventIndex:     int64(eventIndex),
-		EventType:      fields.GetString(events.EventType),
-		EventNamespace: apidefaults.Namespace,
-		CreatedAt:      created.Unix(),
-		Fields:         string(data),
-	}
-	start := time.Now()
-	_, err = l.svc.Collection(l.CollectionName).Doc(l.getDocIDForEvent(event)).Create(l.svcContext, event)
-	writeLatencies.Observe(time.Since(start).Seconds())
-	writeRequests.Inc()
-	if err != nil {
-		return firestorebk.ConvertGRPCError(err)
-	}
-	return nil
-}
-
-// PostSessionSlice sends chunks of recorded session to the event log
-func (l *Log) PostSessionSlice(slice events.SessionSlice) error {
-	batch := l.svc.Batch()
-	for _, chunk := range slice.Chunks {
-		// if legacy event with no type or print event, skip it
-		if chunk.EventType == events.SessionPrintEvent || chunk.EventType == "" {
-			continue
-		}
-		fields, err := events.EventFromChunk(slice.SessionID, chunk)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		data, err := json.Marshal(fields)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-		event := event{
-			SessionID:      slice.SessionID,
-			EventNamespace: apidefaults.Namespace,
-			EventType:      chunk.EventType,
-			EventIndex:     chunk.EventIndex,
-			CreatedAt:      time.Unix(0, chunk.Time).In(time.UTC).Unix(),
-			Fields:         string(data),
-		}
-		batch.Create(l.svc.Collection(l.CollectionName).Doc(l.getDocIDForEvent(event)), event)
-	}
-	start := time.Now()
-	_, err := batch.Commit(l.svcContext)
-	batchWriteLatencies.Observe(time.Since(start).Seconds())
-	batchWriteRequests.Inc()
-	if err != nil {
-		return firestorebk.ConvertGRPCError(err)
-	}
-	return nil
-}
-
-func (l *Log) UploadSessionRecording(events.SessionRecording) error {
-	return trace.NotImplemented("UploadSessionRecording not implemented for firestore backend")
 }
 
 // GetSessionChunk returns a reader which can be used to read a byte stream
@@ -585,7 +506,7 @@ func (l *Log) searchEventsOnce(fromUTC, toUTC time.Time, namespace string, limit
 		}
 
 		// Check that the filter condition is satisfied.
-		if filter.condition != nil && !filter.condition(fields) {
+		if filter.condition != nil && !filter.condition(utils.Fields(fields)) {
 			continue
 		}
 
@@ -628,9 +549,9 @@ func (l *Log) searchEventsOnce(fromUTC, toUTC time.Time, namespace string, limit
 // SearchSessionEvents returns session related events only. This is used to
 // find completed sessions.
 func (l *Log) SearchSessionEvents(fromUTC, toUTC time.Time, limit int, order types.EventOrder, startKey string, cond *types.WhereExpr) ([]apievents.AuditEvent, string, error) {
-	filter := searchEventsFilter{eventTypes: []string{events.SessionEndEvent}}
+	filter := searchEventsFilter{eventTypes: []string{events.SessionEndEvent, events.WindowsDesktopSessionEndEvent}}
 	if cond != nil {
-		condFn, err := events.ToEventFieldsCondition(cond)
+		condFn, err := utils.ToFieldsCondition(cond)
 		if err != nil {
 			return nil, "", trace.Wrap(err)
 		}
@@ -641,7 +562,7 @@ func (l *Log) SearchSessionEvents(fromUTC, toUTC time.Time, limit int, order typ
 
 type searchEventsFilter struct {
 	eventTypes []string
-	condition  events.EventFieldsCondition
+	condition  utils.FieldsCondition
 }
 
 // WaitForDelivery waits for resources to be released and outstanding requests to
@@ -692,7 +613,7 @@ func (l *Log) Close() error {
 }
 
 func (l *Log) getDocIDForEvent(event event) string {
-	return uuid.New()
+	return uuid.New().String()
 }
 
 func (l *Log) purgeExpiredEvents() error {
@@ -731,7 +652,7 @@ func (l *Log) purgeExpiredEvents() error {
 }
 
 // StreamSessionEvents streams all events from a given session recording. An error is returned on the first
-// channel if one is encountered. Otherwise it is simply closed when the stream ends.
+// channel if one is encountered. Otherwise the event channel is closed when the stream ends.
 // The event channel is not closed on error to prevent race conditions in downstream select statements.
 func (l *Log) StreamSessionEvents(ctx context.Context, sessionID session.ID, startIndex int64) (chan apievents.AuditEvent, chan error) {
 	c, e := make(chan apievents.AuditEvent), make(chan error, 1)

@@ -23,7 +23,6 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -32,8 +31,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
-	"github.com/pborman/uuid"
 
 	"github.com/gravitational/teleport/lib/asciitable"
 	"github.com/gravitational/teleport/lib/client"
@@ -120,8 +119,8 @@ func onAWS(cf *CLIConf) error {
 // genAndSetAWSCredentials generates and returns fake AWS credential that are used
 // for signing an AWS request during aws CLI call and verified on local AWS proxy side.
 func genAndSetAWSCredentials() (*credentials.Credentials, error) {
-	id := uuid.NewUUID().String()
-	secret := uuid.NewUUID().String()
+	id := uuid.New().String()
+	secret := uuid.New().String()
 	if err := setFakeAWSEnvCredentials(id, secret); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -155,7 +154,7 @@ func createLocalAWSCLIProxy(cf *CLIConf, tc *client.TeleportClient, cred *creden
 	lp, err := alpnproxy.NewLocalProxy(alpnproxy.LocalProxyConfig{
 		Listener:           listener,
 		RemoteProxyAddr:    tc.WebProxyAddr,
-		Protocol:           alpncommon.ProtocolHTTP,
+		Protocols:          []alpncommon.Protocol{alpncommon.ProtocolHTTP},
 		InsecureSkipVerify: cf.InsecureSkipVerify,
 		ParentContext:      cf.Context,
 		SNI:                address.Host(),
@@ -292,7 +291,7 @@ func newTempSelfSignedLocalCert() (*tempSelfSignedLocalCert, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	f, err := ioutil.TempFile("", "*_aws_local_proxy_cert.pem")
+	f, err := os.CreateTemp("", "*_aws_local_proxy_cert.pem")
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
